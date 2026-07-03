@@ -96,14 +96,68 @@ def _venv_python():
     return win if os.name == "nt" else nix
 
 
+def _interpreter_version(argv):
+    """Run `argv -c ...` and return 'major.minor', or None if it fails."""
+    try:
+        r = subprocess.run(argv + ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _interpreter_tkinter_ok(argv):
+    """Check that tkinter actually loads a Tcl runtime on this interpreter.
+    A venv doesn't bundle its own Tcl/Tk — it just inherits the base
+    interpreter's, so a Python missing the "tcl/tk and IDLE" install
+    component, or with a stray TCL_LIBRARY env var left over from another
+    Python install on the same machine, creates a venv that later crashes
+    the pipeline UIs with a Tcl version-conflict error instead of failing
+    here with a clear one."""
+    try:
+        r = subprocess.run(argv + ["-c", "import tkinter; tkinter.Tcl()"],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _base_python():
-    """A real Python interpreter to create the .venv (not the frozen .exe)."""
+    """A real Python 3.11/3.12 interpreter with working tkinter/Tcl, used to
+    create the .venv (not the frozen .exe). Returns the invocation as a list
+    of args (e.g. ["py", "-3.12"]). Raises RuntimeError with a specific
+    message if a 3.11/3.12 interpreter exists but its Tcl is broken; returns
+    None if no 3.11/3.12 interpreter exists at all — checking here avoids
+    building a venv with the wrong Python and failing later with a cryptic
+    pip wheel-not-found or Tcl error (S9)."""
     if not getattr(sys, "frozen", False):
-        return sys.executable
-    for c in ("py", "python", "python3"):
+        return [sys.executable]
+    candidates = []
+    if os.name == "nt":
+        py = shutil.which("py")
+        if py:
+            candidates += [[py, "-3.12"], [py, "-3.11"]]
+    for c in ("python3.12", "python3.11", "python", "python3"):
         exe = shutil.which(c)
         if exe:
-            return exe
+            candidates.append([exe])
+    bad_tk = []
+    for argv in candidates:
+        if _interpreter_version(argv) not in ("3.11", "3.12"):
+            continue
+        if _interpreter_tkinter_ok(argv):
+            return argv
+        bad_tk.append(" ".join(argv))
+    if bad_tk:
+        raise RuntimeError(
+            "Found Python (%s) but its tkinter/Tcl is broken.\n\n"
+            "This usually means Python was installed without the \"tcl/tk and "
+            "IDLE\" option, or a TCL_LIBRARY environment variable is pointing "
+            "at a different Python install's Tcl folder (common with multiple "
+            "Python versions on one machine).\n\n"
+            "Fix: reinstall Python 3.11 or 3.12 from python.org with tcl/tk "
+            "enabled, and check for a stray TCL_LIBRARY in your environment "
+            "variables." % ", ".join(bad_tk))
     return None
 
 
@@ -203,10 +257,11 @@ def _ensure_env(key, set_status):
         set_status("Creating environment (.venv) …")
         base = _base_python()
         if not base:
-            raise RuntimeError("No Python interpreter found to create the .venv.\n"
-                               "Install Python 3.11 or 3.12 from python.org and try again.")
+            raise RuntimeError("No Python 3.11 or 3.12 interpreter found to create the .venv.\n"
+                               "Install Python 3.11 or 3.12 from python.org (check "
+                               "\"Add python.exe to PATH\" during install) and try again.")
         try:
-            r = subprocess.run([base, "-m", "venv", os.path.join(_DIR, ".venv")],
+            r = subprocess.run(base + ["-m", "venv", os.path.join(_DIR, ".venv")],
                                capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
             raise RuntimeError(
