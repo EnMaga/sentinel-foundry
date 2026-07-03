@@ -1,0 +1,81 @@
+name: build-installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach builds to (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: win64
+          - os: macos-latest
+            suffix: macos-arm64
+          - os: macos-13
+            suffix: macos-intel
+          - os: ubuntu-latest
+            suffix: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check tkinter is available
+        run: python -c "import tkinter"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller pillow
+
+      - name: Build launcher
+        run: pyinstaller --noconfirm --onefile --windowed --icon sentinel_foundry.ico --name "Sentinel Foundry" sentinel_foundry.py
+
+      - name: Stage release folder
+        shell: bash
+        run: |
+          mkdir SentinelFoundry
+          cp s1_pipeline_ui.py s2_pipeline_ui.py check_safe.py \
+             requirements.txt requirements_s2.txt \
+             sentinel_foundry.ico sentinel_foundry.png README.md LICENSE \
+             SentinelFoundry/
+          cp -r snap_graphs SentinelFoundry/
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "dist/Sentinel Foundry.exe" SentinelFoundry/
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            cp -R "dist/Sentinel Foundry.app" SentinelFoundry/
+          else
+            cp "dist/Sentinel Foundry" SentinelFoundry/
+          fi
+
+      - name: Zip
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="SentinelFoundry-${TAG#v}-${{ matrix.suffix }}.zip"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "$NAME" SentinelFoundry
+          else
+            # zip (not tar) keeps it one instruction for users; -y keeps symlinks in the .app
+            zip -qry "$NAME" SentinelFoundry
+          fi
+          echo "ASSET=$NAME" >> "$GITHUB_ENV"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ env.ASSET }}
