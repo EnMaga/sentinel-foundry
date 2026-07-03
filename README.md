@@ -11,6 +11,18 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 
 ## Quick start
 
+**Option A — download a ready-made build (no git needed):** grab the zip for
+your OS from the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases),
+extract it anywhere, and double-click **`Sentinel Foundry.exe`** (Windows;
+macOS/Linux builds coming). Keep everything together in the extracted folder —
+the launcher looks for the pipeline scripts next to itself and builds its
+`.venv` there on first run. You still need **Python 3.11/3.12, ESA SNAP and
+GDAL** installed (see "Requires manual install" below). The build is unsigned,
+so the first launch shows a security warning — see
+"Opening the app (unsigned build)".
+
+**Option B — clone and run from source:**
+
 ```bash
 git clone https://github.com/EnMaga/sentinel-foundry.git
 cd sentinel-foundry
@@ -500,7 +512,7 @@ If you use Sentinel Foundry in your research, please cite it — see
 
 ## 🚧 In development
 
-- **One-click installers** — standalone packages with Python and all dependencies bundled (Windows `setup.exe`, Linux `tar.gz`, macOS `dmg`), built via GitHub Actions on release tags. SNAP and GDAL remain external prerequisites. Working locally; will be activated with the first public release of this repository.
+- **One-click builds** — the Windows build is on the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases); macOS and Linux builds are coming. Python, SNAP and GDAL remain external prerequisites.
 - ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
