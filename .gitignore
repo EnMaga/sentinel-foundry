@@ -1,0 +1,96 @@
+# venv
+.venv/
+
+# saved credentials and paths (do not commit)
+sar_foundry_config.json
+optical_foundry_config.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# research data — not part of the tool
+h2o_results/
+VV_S1_MSC_lee7x7/
+VV_S1_SNAP_python_output/
+VV_S1_SNAP_indices/
+SNAP_tiles/
+snap_comparison/
+SNAP UI PROVA/
+VV_S1_MapScape/
+VV_S1_microsoftcomputerREADY_outputs/
+VV_S2_outputs/
+RASTERS/
+QGIS/
+Papers/
+DATAREADY for analyses/
+geojson_by_year_month_from_wkt/
+geojson_events/
+
+# data files
+*.SAFE
+*.zip
+*.tif
+*.html
+*.csv
+*.log
+*.pdf
+*.docx
+*.pptx
+*.dim
+*.aux.xml
+cnn_*.log
+
+# other tools and outputs
+node_modules/
+make_pptx.js
+make_setup_report.js
+snap_batch_python.py
+
+# research / diagnostic scripts (not part of the tool)
+s2_check_scenes.py
+check_pc_coverage.py
+compare_snap_vs_msc_lee.py
+satellite_event_pipeline.py
+tractor.py
+tractor2.py
+launch.bat
+outputs_assignment/
+outputs_timeline/
+*.md
+!README.md
+*.bib
+*.json
+drawn_aoi.geojson
+AOI_Jolanda.*
+Fields_BF-JDS_wkt.geojson
+fields_unique.geojson
+san_michele_*.json
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# --- Sentinel Foundry website (docs/) — published via GitHub Pages ---
+# (overrides the *.html rule above so the site is tracked)
+!docs/
+!docs/**
+docs/assets/_pal.png
+
+# personal Windows launcher (kept locally, not committed)
+Sentinel Foundry.bat
+
+# leftover palette files from GIF generation
+docs/assets/_pal*.png
+
+# packaged-build sandbox (local only)
+installer_dev/
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.exe

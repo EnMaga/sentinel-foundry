@@ -1,0 +1,548 @@
+# Sentinel Foundry - SAR & Optical 🛰️
+
+Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipelines — point-and-click, self-installing, no credentials needed for S2.
+
+| Tool | Script | Satellite | Source |
+|------|--------|-----------|--------|
+| **SAR Foundry** | `s1_pipeline_ui.py` | Sentinel-1 GRD | ASF (NASA Earthdata) |
+| **Optical Foundry** | `s2_pipeline_ui.py` | Sentinel-2 L2A | AWS EarthSearch (public) |
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/EnMaga/sentinel-foundry.git
+cd sentinel-foundry
+```
+
+**Launcher (recommended — one window, handles setup):**
+```cmd
+python sentinel_foundry.py
+```
+The launcher opens a single window with two buttons — **SAR Foundry** (Sentinel-1) and **Optical Foundry** (Sentinel-2). When you pick a tool the first time, the launcher creates the shared `.venv` and installs **that tool's** Python packages (`requirements.txt` for SAR, `requirements_s2.txt` for Optical), then starts it; a per-tool marker means it won't reinstall on later launches. The window also links to the manual, non-Python prerequisites (**ESA SNAP with the Microwave Toolbox**, **GDAL**) — these can't be pip-installed and are needed by SAR Foundry. For a clickable desktop icon, see the next step.
+
+**Desktop icon (optional, any OS):** cloning a repo can't place a desktop shortcut for you, so run this once after cloning to create one with the Sentinel Foundry icon:
+```cmd
+python install_sentinelfoundry.py
+```
+It detects your system and makes the right launcher — a `.lnk` on Windows, a `.desktop` entry on Linux, or a small `.app` bundle on macOS — all pointing at `sentinel_foundry.py`.
+
+**Run a single tool directly (optional):** the launcher is the easy path, but you can also start a tool on its own — `python s1_pipeline_ui.py` (SAR) or `python s2_pipeline_ui.py` (Optical). On first run each script creates the shared `.venv` and installs its dependencies; afterwards `.venv\Scripts\python.exe <script>` (Windows) or `python3 <script>` (macOS / Linux) skips the bootstrap and starts faster.
+
+---
+
+## SAR Foundry — Sentinel-1 GRD → ARD → COG Indices
+
+Converts raw Sentinel-1 GRD scenes into ARD (Analysis Ready Data): calibrated, speckle-filtered, geocoded to UTM, clipped to your AOI.
+
+**Outputs — 5 single-band COG GeoTIFFs per scene, organised by orbit:**
+
+```
+output/
+  ASC/
+    S1_YYYYMMDD_SNAP_AOI_[label]_[speckle]_[dem]_[graph]_A_ASC_VV.tif
+    S1_YYYYMMDD_SNAP_AOI_[label]_[speckle]_[dem]_[graph]_A_ASC_VH.tif
+    S1_YYYYMMDD_SNAP_AOI_[label]_[speckle]_[dem]_[graph]_A_ASC_CR.tif    # VH/VV cross-ratio
+    S1_YYYYMMDD_SNAP_AOI_[label]_[speckle]_[dem]_[graph]_A_ASC_RVI.tif   # 4·VH/(VV+VH)
+    S1_YYYYMMDD_SNAP_AOI_[label]_[speckle]_[dem]_[graph]_A_ASC_DIFF.tif  # VH−VV (linear)
+  DSC/
+    ...
+```
+
+`[graph]` records the preprocessing chain (section 2): `sigma0` or `gamma0` for the built-in presets, or — for a custom graph — the imported XML's file name reduced to alphanumerics (e.g. `my_chain.xml` → `mychain`). So a σ⁰ run with no speckle filter on Copernicus 30 m DEM is tagged `none_cop30_sigma0`.
+
+`[speckle]` is the speckle filter selected in section 2b:
+
+| UI selection | Tag in filename |
+|---|---|
+| Lee Sigma 7×7 (default) | `lee` |
+| Gamma Map 7×7 | `gamma` |
+| Custom → Lee Sigma | `lee_sigma` |
+| Custom → Refined Lee | `refined_lee` |
+| Custom → Gamma Map | `gamma_map` |
+| Custom → IDAN | `idan` |
+| Custom → Boxcar / Median / Frost | `boxcar` / `median` / `frost` |
+| Custom → None (no filter) | `none` |
+
+All outputs: float32 linear power, nodata = −9999, DEFLATE compressed, 10 m pixel spacing.  
+Optional dB copies (suffix `_dB`) can be enabled in section 9 of the GUI — for display only.
+
+**Custom Bands:** up to 3 user-defined expressions evaluated per scene using numpy. Available variables: `VV`, `VH`, `CR`, `RVI`, `DIFF`, `np`, `NODATA` (all linear intensity). Examples: `VH/VV` · `(VV-VH)/(VV+VH)` · `np.sqrt(VH/VV)`. Custom outputs are always saved as `_lin.tif` and follow the same COG profile as preset bands.
+
+**Pipeline tabs (GUI):**
+
+| Tab | Section | Description |
+|-----|---------|-------------|
+| ⬇ Download | 1 | Sentinel-1 Source — download from ASF, Copernicus CDSE, or use existing `.SAFE` folder |
+| ⬇ Download | 3 | Area of Interest — `.shp`, `.gpkg`, `.geojson`, or draw on interactive map |
+| ⬇ Download | 4 | Date Range — with optional calendar picker |
+| ⬇ Download | 5 | Orbit Direction — ASC, DSC, or Both |
+| ⬇ Download | 6 | ASF Credentials — NASA Earthdata token or username/password |
+| ⬇ Download | 6b | Copernicus CDSE Credentials — refresh/offline token only for CDSE download |
+| ⬇ Download | **7** | **Parallel Downloads — 1–5 scenes simultaneously with real-time Mbps display** |
+| ⚙ Processing | 2 | Preprocessing Graph — σ⁰ Standard, γ⁰ RTC, or custom XML |
+| ⚙ Processing | 2b | Speckle Filter — Lee Sigma, Gamma Map, or fully configurable custom |
+| ⚙ Processing | 2c | DEM for Terrain Correction — Copernicus 30m default |
+| ⚙ Processing | 8 | Output Bands — toggle which preset bands to compute |
+| ⚙ Processing | — | **Custom Bands — up to 3 user-defined numpy expressions (VV, VH, CR, RVI, DIFF)** |
+| ⚙ Processing | 9 | Output Scale — Linear and/or dB |
+| 📁 Output | 7 | Pipeline Steps — enable/disable steps; retry failed downloads |
+| 📁 Output | 10 | Output Paths — Raw SAFE / SNAP tiles / COG indices folders |
+| 📁 Output | 11 | Output CRS — AUTO (native UTM) or any EPSG code |
+| 🧮 Raster Calc | — | Post-processing calculator — apply numpy expressions to existing COG outputs |
+
+---
+
+### Preprocessing Graph (section 2)
+
+The GUI lets you choose between two built-in processing chains or supply your own SNAP GPT graph XML.
+
+#### Option A — σ⁰ Standard  *(recommended for flat terrain)*
+
+`snap_graphs/s1_sigma0_standard.xml`
+
+```
+Apply-Orbit-File
+  → ThermalNoiseRemoval
+  → Remove-GRD-Border-Noise
+  → Calibration → σ⁰ (sigma-nought, linear)
+  → Speckle-Filter: [configurable — see section 2b]
+  → Range-Doppler Terrain Correction
+      DEM: [configurable — see section 2c]  |  10 m  |  UTM 32N  |  aligned grid
+      nodataValueAtSea = false
+  → Subset to AOI  → Write (GeoTIFF)
+```
+
+Based on Filipponi (2019). No Terrain-Flattening. Correct for flat agricultural terrain (e.g. Po Valley). Simpler, faster, and matches the majority of SAR agricultural literature.
+
+#### Option B — γ⁰ RTC  *(terrain-flattened, more rigorous)*
+
+`snap_graphs/s1_gamma0_rtc.xml`
+
+```
+Apply-Orbit-File
+  → ThermalNoiseRemoval
+  → Remove-GRD-Border-Noise
+  → Calibration → β⁰ (beta-nought, linear)
+  → Speckle-Filter: [configurable — see section 2b]
+  → Terrain-Flattening
+      β⁰ → γ⁰  |  DEM: [configurable — see section 2c]  |  nodataValueAtSea = false
+  → Range-Doppler Terrain Correction
+      DEM: [configurable — see section 2c]  |  10 m  |  UTM 32N  |  aligned grid
+      nodataValueAtSea = false
+  → Subset to AOI  → Write (GeoTIFF)
+```
+
+Based on Small (2011). Radiometrically correct for sloped terrain. `nodataValueAtSea = false` in both TF and TC prevents water canals and drainage ditches from being incorrectly zeroed out.
+
+> **Which to choose?** For flat areas (Po Valley, lowland agriculture) Option A is correct and sufficient. Option B adds value only when your AOI includes significant topographic variation.
+
+#### Option C — Custom XML
+
+Select "Custom XML" in section 2 and browse to any SNAP GPT graph XML on your computer. The pipeline edits the graph at runtime, so your file only needs to define the *processing*, not the I/O paths.
+
+**What the pipeline patches automatically (do not hard-code these):**
+
+- the **`Read`** node's `file` → set to each scene's `.SAFE` manifest;
+- a **`Subset`** node → injected just before `Write` to clip to your AOI;
+- the **`Write`** node's `file` and `formatName` → set to the output path and `GeoTIFF-BigTIFF`;
+- the **`Speckle-Filter`** node's parameters (if the node exists) → replaced with your section-2b choice;
+- the **`demName`** on any **`Terrain-Flattening`** / **`Terrain-Correction`** node → set to your section-2c DEM.
+
+**Rules a custom graph MUST follow (or the run fails / produces wrong indices):**
+
+1. **Exactly one `Read` node** (`<operator>Read</operator>`) with a `<parameters><file>` element. Put any placeholder path there — it gets overwritten. Avoid `ProductSet-Reader` (SNAP rejects it before execution).
+2. **Exactly one `Write` node** whose `<sources>` points at your final processing step. Leave its `file`/`formatName` as anything — they're overwritten. The AOI `Subset` is spliced in between your last node and `Write`, so the last real operator is normally **Terrain-Correction**.
+3. **Output must be 2 bands, in the order VH (band 1) then VV (band 2)**, as **linear** intensity (σ⁰, γ⁰ or β⁰ — not dB). Step 3 reads them positionally (`band 1 = VH`, `band 2 = VV`); if you swap the order or output dB, CR/RVI/DIFF come out wrong. Keep `selectedPolarisations` = `VH,VV` on the calibration/noise nodes (this is what the built-in graphs do).
+4. Build it the easy way: open SNAP **Tools → Graph Builder**, assemble `Read → … → Terrain-Correction → Write`, and **Save** as XML. Don't add your own Subset (the pipeline adds it) and don't set absolute input/output paths.
+5. A `Speckle-Filter` node is **optional** — include it only if you want speckle filtering; its settings are taken from section 2b, not from the file.
+
+The simplest reliable starting point is to copy one of the built-in graphs in `snap_graphs/` (`s1_sigma0_standard.xml` or `s1_gamma0_rtc.xml`) and modify it — they already satisfy all of the above.
+
+---
+
+### Downloads (section 7)
+
+Download behaviour differs between the two sources:
+
+| Source | Parallel support | Why |
+|--------|-----------------|-----|
+| **ASF** | ❌ Sequential only (forced to 1 worker) | ASF's server truncates the VV band when multiple connections share the same user token simultaneously — a known server-side bug, not a bandwidth issue |
+| **Copernicus CDSE** | ✅ Up to 5 parallel workers | CDSE serves files from S3-compatible object storage (Ceph/OpenStack Swift). Bearer tokens are stateless JWTs — multiple threads share the same token without interference, each gets an independent byte stream |
+
+The **parallel downloads** spinner (section 7) is wired to both sources, but ASF ignores values > 1. For CDSE, 2–3 workers is a good balance between speed and fair-use policy.
+
+**Authentication — CDSE:** refresh/offline token only — no email/password path exists in this app, so a CDSE password is never entered or stored. Paste the token in section 6b; the code exchanges it for a short-lived JWT Bearer token via Keycloak and renews it automatically. The pasted refresh token itself is valid ~60 min from when Copernicus issues it, so generate it right before starting a download. See [how to generate a CDSE refresh token](https://documentation.dataspace.copernicus.eu/APIs/Token.html) (the token-generation request returns a `refresh_token` field alongside the access token).
+
+**Connection resilience (both sources):** each download session mounts a `urllib3` retry adapter (exponential backoff; retries on dropped connections, 429 and 5xx). On top of that, each scene is attempted several times with backoff:
+
+- **ASF** — per-scene retry loop (no resume on ASF, so a partial `.zip` is removed between attempts to avoid leaving a truncated archive). Scenes that still fail are added to the end-of-run retry pass.
+- **CDSE** — per-scene retry loop **with resume**: the partial download is written to a `.part` file and continued via an HTTP `Range` request, so a connection that drops at 90 % does not start over. CDSE failures are now retried in-loop (previously they were not).
+
+**Integrity checking (around unzip):** corruption — including the silently-truncated VV band caused by parallel ASF downloads — is caught at two points so it never reaches SNAP:
+
+1. **Before unzip** — a fast structural check of each `.zip` (valid archive, `manifest.safe` present, VV/VH bands present and sensibly sized). This reads only the zip index, *not* every byte, so it costs almost nothing.
+2. **During unzip** — the extractor verifies each member's CRC (7-Zip/`tar` return non-zero, Python `zipfile.extractall` raises); a CRC failure marks the archive corrupt.
+3. **After unzip** — `check_safe()` validates the extracted `.SAFE` (valid manifest, both bands present and not truncated, GeoTIFFs readable via rasterio).
+
+Anything flagged `CORRUPT` is deleted and written to `pipeline_errors/`, so SNAP skips it and a re-run re-downloads what is missing. Heuristic `SUSPECT` cases (e.g. VV much smaller than VH) are kept but flagged in the log for inspection. The checks reuse `check_safe.py` (see below); if that file is absent the pipeline still runs, just without the extra checks.
+
+**Parallel extraction:** unzipping is I/O-latency bound (a single `zipfile` stream leaves the disk mostly idle), so archives are extracted concurrently (`unzip_workers`, default 3). Each scene extracts into its own private temp dir and is then moved into place with a same-volume atomic rename, so SNAP never sees a half-extracted `.SAFE`. The pipeline prefers a **native extractor** — **7-Zip** (`7z`, auto-detected on `PATH` or under `C:\Program Files\7-Zip\`) or **bsdtar** on Windows/macOS — which is markedly faster than Python's `zipfile` on large Sentinel products; if neither is found it falls back to `zipfile` automatically (install 7-Zip to speed this up). Products extracted outside the app (e.g. manually with 7-Zip, which drops the `.SAFE` suffix) are normalised back to `*.SAFE` before SNAP discovery.
+
+A real-time throughput monitor samples directory growth every second and displays current speed in **Mbps** in the progress bar. Average speed per scene is also logged on completion.
+
+#### Standalone integrity checker — `check_safe.py`
+
+The same checks can be run manually on any folder of downloads (e.g. to vet an existing archive before processing):
+
+```
+python check_safe.py "E:\SNAP_Download"     # scan zips + .SAFE dirs (report only)
+python check_safe.py . --delete             # also delete anything CORRUPT
+python check_safe.py . --no-crc             # skip the slow per-byte zip CRC test
+python check_safe.py . --no-deep            # skip the rasterio band-read test
+```
+
+With no path it auto-detects the `safe_dir` from `sar_foundry_config.json`. Exit code is `0` if all products are OK, `1` if any are `SUSPECT`/`CORRUPT`. Standard library only; uses `rasterio` for the deep band read if it is installed (run it with the project venv's Python to enable that).
+
+---
+
+### Speckle Filter (section 2b)
+
+| Mode | Description |
+|------|-------------|
+| **Lee Sigma 7×7** | Default. Analysis window 7×7, target 3×3, σ=0.9, ENL estimated. |
+| **Gamma Map 7×7** | Bayesian filter assuming Gamma-distributed backscatter. Better edge preservation. |
+| **Custom** | Opens a configuration dialog with all 9 SNAP speckle filters. Settings are saved between sessions. |
+
+---
+
+### DEM for Terrain Correction (section 2c)
+
+| DEM | Resolution | Notes |
+|-----|-----------|-------|
+| **Copernicus 30m Global DEM** | ~30 m | Default. GLO-30, best global coverage. |
+| Copernicus 90m Global DEM | ~90 m | Faster download. |
+| SRTM 1 arc-sec HGT | ~30 m | Classic global DEM. |
+| SRTM 3 arc-sec | ~90 m | Broad coverage, older. |
+| ASTER GDEM | ~30 m | Good for areas with SRTM voids. |
+
+DEMs are auto-downloaded by SNAP on first use and cached locally. An internet connectivity indicator is shown next to the dropdown.
+
+---
+
+### Area of Interest (section 3)
+
+**Browse for a file** — accepted formats: `.shp`, `.gpkg`, `.geojson`. Any CRS is accepted — reprojected to EPSG:4326 automatically. Multi-polygon files are unioned.
+
+**Draw on map** — click **🗺 Draw on map** to open an interactive Leaflet map (requires `pywebview` — auto-install prompt). Basemaps: Google Hybrid (default), Google Satellite, OpenStreetMap. Drawn AOI saved as `drawn_aoi.geojson` and persists across sessions.
+
+---
+
+### Multi-tile mosaicking
+
+When your AOI spans two or more adjacent Sentinel-1 frames, tiles are processed independently then merged via **seam interpolation**: TC edge artefact rows are trimmed, and the resulting gap is filled with vertical bilinear interpolation between the two bordering tiles. Final output is always a single `.tif` per date+orbit.
+
+---
+
+### Stop button
+
+Pressing **■ STOP** immediately kills the running SNAP GPT subprocess (`Popen.kill()`), cancels pending downloads, and halts the pipeline. The UI resets to ready state.
+
+---
+
+### Retry failed downloads
+
+If scenes fail to download, the pipeline logs the failure and continues. At the end of the run, if **Retry failed downloads at end** is enabled (section 7), the pipeline re-authenticates and retries the failed scenes.
+
+---
+
+### Opening the app (unsigned build)
+
+The installers are **unsigned** (no paid Apple/Windows code-signing certificate), so your OS will warn you the first time you open the app. This is expected — the warning is about the *missing signature*, not about the app itself. Here's how to get past it, per OS. You only need to do this once.
+
+**Windows** — SmartScreen shows *"Windows protected your PC."*
+1. Click **More info**.
+2. Click **Run anyway**.
+
+**macOS** — Gatekeeper shows *"…cannot be opened because it is from an unidentified developer"* or *"Apple could not verify… is free of malware."*
+1. **Right-click** (or Control-click) the app → **Open**.
+2. Click **Open** in the dialog that appears.
+3. If it's still blocked (recent macOS): **System Settings → Privacy & Security**, scroll to the message naming the app, click **Open Anyway**, then reopen.
+
+   Still stuck? Clear the quarantine flag in Terminal:
+   ```
+   xattr -dr com.apple.quarantine "/Applications/Sentinel Foundry.app"
+   ```
+
+**Linux** — no signature prompt, but the file may not be marked executable:
+1. `chmod +x "Sentinel Foundry"` (or: file manager → **Properties → Permissions → Allow executing file as program**).
+2. Launch it.
+
+---
+
+**Requires manual install:**
+
+| Tool | Windows | macOS | Linux |
+|---|---|---|---|
+| Python 3.11 or 3.12 | [python.org](https://www.python.org/downloads/) | `brew install python@3.12` | `sudo apt install python3.12` |
+| ESA SNAP **(must include the Microwave Toolbox = Sentinel-1 Toolbox)** | [step.esa.int](https://step.esa.int/main/download/snap-download/) | same | same |
+| GDAL | via [QGIS](https://qgis.org) or OSGeo4W | `brew install gdal` | `sudo apt install gdal-bin` |
+
+**Installing SNAP correctly** — only three installer choices matter:
+
+1. **Components:** the **Microwave Toolbox** *must* be ticked. (This is the SAR / Sentinel-1 toolbox — named **"Microwave Toolbox"** in SNAP 12 / 13, formerly **"Sentinel-1 Toolbox" / S1TBX** in SNAP ≤ 11.) It provides the `eu.esa.sar.*` modules the pipeline reads `.SAFE` files with. Simplest safe choice: leave **all** components ticked.
+2. **Python / esa_snappy step:** leave it **unticked** — not needed. The pipeline drives SNAP via the `gpt` command line, not the Python binding.
+3. **Final screen:** **"Extend my PATH"** is optional but recommended (lets you run `gpt` from any terminal).
+
+After install, open SNAP once → **Help → Check for Updates → install all → restart**. Then verify in a new terminal:
+
+```
+gpt Calibration -h      (or  "C:\Program Files\esa-snap\bin\gpt.EXE" Calibration -h)
+```
+
+Clean operator help = good. A Java `eu.esa.sar...` stack trace = the Microwave Toolbox is missing → see Troubleshooting below. Without it, the `gpt` step fails on *every* scene at startup.
+
+> The app self-checks this: the Dependencies panel runs `gpt Calibration -h` at startup, and if SNAP can't load the SAR operators it marks **SNAP GPT** as failed and **blocks the START button** with a clear message — so you find out before a run, not after every scene fails. (The check spins up the SNAP JVM, so it can take up to a minute on a cold first start.)
+
+**Credentials:** NASA Earthdata account required → [Register here](https://urs.earthdata.nasa.gov/users/new)
+
+**Authentication — Bearer token (recommended):**
+1. Log in at [urs.earthdata.nasa.gov/user_tokens](https://urs.earthdata.nasa.gov/documentation/for_users/user_token)
+2. Click **Generate Token**
+3. Paste into the **Token** field in section 6
+
+---
+
+### Running several runs at once
+
+The launcher (Sentinel Foundry) does **not** limit how many SAR Foundry windows you open — click **Open** as many times as you like, point each window at a different AOI / date range, and they run independently and concurrently. On a powerful machine this is a quick way to process several regions at once; on a modest one it will oversubscribe CPU and RAM and slow everything down, so size it deliberately.
+
+What matters is memory. Each SAR Foundry window runs its own SNAP jobs, configured in section **2e "Parallel SNAP Jobs"** (number of parallel SNAP workers, and the JVM heap per worker). The total memory in flight across everything is roughly:
+
+```
+windows  ×  workers-per-window  ×  JVM-GB-per-worker
+```
+
+Keep that under ~70–80% of your physical RAM, and keep the **total** worker count near your CPU core count (Terrain Correction is CPU-bound). Example for a 32 GB / 8-core machine:
+
+- **One run, fast:** 1 window · 2–3 workers · 8 GB heap (~16–24 GB).
+- **Two runs in parallel:** 2 windows · 1 worker each · 8 GB heap (~16 GB).
+- **More runs:** drop to 1 worker per window and lower the heap so `windows × workers × heap` still fits.
+
+If you over-commit, you'll see heavy disk swapping, SNAP out-of-memory / "GC overhead" errors, and a net slowdown rather than a speedup. SAR Foundry's Dependencies panel warns when *one* window's `workers × heap` exceeds available RAM — but it cannot see the other windows, so when running several you must do that arithmetic across all of them yourself. Disk matters too: concurrent runs hammer I/O, so prefer an SSD and, where possible, point each run at a different output drive to avoid contention.
+
+### Troubleshooting
+
+**Every scene fails at SNAP with `ClassNotFoundException: eu.esa.sar...` (e.g. `eu.esa.sar.io.ceos.CEOSProductReaderPlugIn` or `eu.esa.sar.commons.polsar.PolBandUtils`).**
+
+Cause: SNAP was installed **without the Microwave Toolbox** (called **"Sentinel-1 Toolbox" / S1TBX** in SNAP ≤ 11, renamed **"Microwave Toolbox"** in SNAP 12 / 13), so the `eu.esa.sar.*` modules (the S1 product readers and the core SAR classes the radar operators depend on) are missing. `gpt` then crashes while loading plugins — *before* reading any data — so the download/unzip steps succeed but every scene fails identically in step 2. This is purely a SNAP install problem; reverting the pipeline code does not help.
+
+Confirm it:
+```
+"C:\Program Files\esa-snap\bin\gpt.EXE" Calibration -h
+```
+A Java stack trace mentioning `eu.esa.sar` = the toolbox is missing. You can also check directly — a healthy install has an `s1tbx` folder next to `rstb`:
+```
+dir /b "C:\Program Files\esa-snap"
+```
+
+Fix (clean reinstall):
+1. Uninstall SNAP, then delete leftovers: `C:\Program Files\esa-snap`, `C:\Users\<you>\.snap`, `C:\Users\<you>\AppData\Roaming\SNAP`, `C:\Users\<you>\AppData\Local\SNAP`.
+2. Reinstall using the **"ESA SNAP — All Toolboxes"** installer and keep **Sentinel-1 Toolbox** ticked.
+3. Open SNAP once → **Help → Check for Updates → install all → restart**.
+4. Re-verify with `gpt Calibration -h` (should print help, no stack trace), then re-run the pipeline — it skips already-downloaded scenes and resumes at SNAP.
+
+> This commonly appears after reinstalling Windows or SNAP, when a partial component set is chosen.
+
+**`ImportError: DLL load failed … An Application Control policy has blocked this file` (e.g. importing `rasterio`), or "Smart App Control has blocked part of this app".**
+
+Cause: **Windows 11 Smart App Control** (part of Windows Security) blocks binaries it doesn't trust. The geo stack ships **unsigned native libraries** (rasterio's `_base.pyd`, the GDAL DLLs, etc.), so once Smart App Control is enforcing it can block them and every `import rasterio` fails — which the dependency panel then reports as `Missing: rasterio`. It tends to (re)appear after the packages are (re)installed, because the freshly written files get re-evaluated.
+
+Fix: **Windows Security → App & browser control → Smart App Control → Off.** No reinstall of the packages is needed — the existing files load again immediately. Verify with:
+```
+.venv\Scripts\python.exe -c "import rasterio; print(rasterio.__version__)"
+```
+
+> Turning Smart App Control off used to be permanent (re-enabling required reinstalling Windows); since the April 2026 Windows 11 cumulative update it can be toggled off and back on freely. On a machine running scientific Python (rasterio/GDAL, SNAP, …) Smart App Control will keep flagging these unsigned libraries, so leaving it off is the practical choice. The only alternative is code-signing every native binary with a Microsoft-trusted certificate.
+
+**Verify downloads independently** at any time with `check_safe.py` (see the Downloads section above).
+
+---
+
+## Optical Foundry — Sentinel-2 L2A → COG Indices + Biophysicals
+
+Downloads Sentinel-2 L2A from **AWS EarthSearch** (public, no credentials), applies SCL cloud masking, and computes biophysical variables, spectral bands and indices as 10m COG GeoTIFFs.
+
+> **Why AWS and not Copernicus Data Space (CDSE)?**
+> The biophysical processor relies on [`satellitetools`](https://github.com/ollinevalainen/satellitetools), which is built on top of the AWS EarthSearch STAC API and AWS S3 public bucket (`sentinel-2-l2a-cogs`). Data access is **completely free and anonymous** — no Copernicus or ESA account needed. Switching to CDSE would require reimplementing the entire search + download layer. Since AWS and CDSE carry the same Sentinel-2 L2A products (ESA ground-truth), there is no scientific difference. The Raster Calculator tab works on any GeoTIFF output regardless of where the data was downloaded from.
+
+### Output filenames
+
+| Situation | Filename |
+|---|---|
+| Single MGRS tile | `S2_YYYYMMDD_000_[label]_[A/B/C]_[product].tif` |
+| AOI spans two tiles → mosaic | `S2_YYYYMMDD_000_[label]_mosaic_[product].tif` |
+| Scene Classification Layer | `S2_YYYYMMDD_000_[label]_[A/B/C]_SCL.tif` |
+
+```
+output/
+  index=LAI/aoi=[label]/S2_YYYYMMDD_000_[label]_A_LAI.tif
+  index=CCC/...   # Canopy Chlorophyll Content
+  index=CWC/...   # Canopy Water Content
+  index=FAPAR/...
+  index=FCOVER/...
+  index=B2/...    index=B3/...  index=B4/...  index=B5/...
+  index=B6/...    index=B7/...  index=B8/...  index=B8A/...
+  index=B11/...   index=B12/...
+  index=NDVI/...  index=NDWI/... index=NDII/...
+  index=MSAVI2/.. index=CIRE/.. index=EVI/...
+  index=NDRE1/... index=MTCI/...
+  index=SCL/...   # raw Scene Classification Layer for QA
+```
+
+All outputs: float32, nodata = −9999, DEFLATE compressed, 10m UTM.
+
+**Custom Indices:** up to 3 user-defined expressions evaluated during the pipeline run, after preset spectral indices. Available variables: `B2`, `B3`, `B4`, `B5`, `B6`, `B7`, `B8`, `B8A`, `B11`, `B12`, `np`. All values are reflectance (0–1). Examples: `(B8-B4)/(B8+B4+1e-9)` · `(B8A-B5)/(B8A+B5)` · `B8/B5-1`. Custom outputs are saved under `index=<name>/aoi=<label>/` with the same COG profile as preset indices. Valid for spectral indices only — biophysical variables (LAI, CCC, etc.) always use AWS EarthSearch via `satellitetools`.
+
+**Pipeline tabs (GUI):**
+
+| Tab | Section | Description |
+|-----|---------|-------------|
+| ⬇ Download | 1 | Area of Interest — `.shp`, `.gpkg`, `.geojson`, or draw on interactive map |
+| ⬇ Download | 2 | Date Range |
+| ⬇ Download | 3 | Max Cloud Cover — scene-level threshold (0 = disabled) |
+| ⬇ Download | 4 | **Parallel Workers — 1–8 days processed simultaneously** |
+| ⬇ Download | 5 | **Network Error Handling — retry failed days (configurable 1–3 attempts, 10 s back-off)** |
+| ⚙ Processing | — | Biophysical outputs — toggle with select-all |
+| ⚙ Processing | — | Spectral Bands — toggle with select-all |
+| ⚙ Processing | — | Spectral Indices — toggle with select-all |
+| ⚙ Processing | — | **Custom Indices — up to 3 user-defined numpy expressions (B2–B12), computed during run** |
+| 📁 Output | — | Output CRS — AUTO (native UTM) or any EPSG |
+| 📁 Output | — | Output Folder |
+| 📁 Output | — | **Existing Files — Skip (resume) or Overwrite** |
+| 🧮 Raster Calc | — | Post-processing calculator — apply numpy expressions to existing COG outputs |
+
+---
+
+### Per-tile mosaicking (cross-MGRS-tile AOIs)
+
+When an AOI straddles two MGRS tiles (e.g. 32TQN + 32TQP), `satellitetools` internally selects only one tile per acquisition, leaving the other half of the AOI as nodata on dates when the selected tile has a partial swath.
+
+The pipeline now performs **explicit per-tile processing**:
+
+1. A direct EarthSearch query discovers every `(tile_id, sat_letter)` pair available for the date.
+2. For each tile, a thread-local monkey-patch filters the satellitetools search to that tile only — guaranteeing real data from both 32TQN and 32TQP.
+3. Each tile is processed independently (bands, indices, biophysicals, SCL mask).
+4. If two or more tile files exist for the same date and variable, `rasterio.merge(method="first")` produces a single mosaic covering the full AOI. Intermediate per-tile files are deleted.
+
+The satellite letter (`A`, `B`, `C`) is extracted directly from the STAC item ID (e.g. `S2A_32TQN_20250325_0_L2A`) — no longer relies on the rarely-populated `satellite_id` coordinate.
+
+---
+
+### Parallel processing
+
+Days are processed in parallel using `ThreadPoolExecutor` (configurable 1–8 workers). Each worker independently queries EarthSearch, downloads band data from AWS S3, applies the SCL mask, and writes COG outputs. All UI callbacks are thread-safe. A real-time ETA is shown based on average seconds per completed day.
+
+---
+
+### Retry on network errors
+
+Failed days are collected during the run. If **Retry failed days** is enabled, the pipeline waits 10 seconds then re-attempts up to the configured number of times. Useful for transient AWS S3 or EarthSearch timeouts.
+
+---
+
+### Skip / Overwrite existing files
+
+- **Skip** (default): if a file already exists on disk, its path is registered (so the mosaic step can include it) but it is not re-downloaded or reprocessed. Efficient for extending a date range or resuming an interrupted run.
+- **Overwrite**: all files are rewritten, including mosaics.
+
+---
+
+**No manual installs required** beyond Python. All packages installed automatically on first run from `requirements_s2.txt`.
+
+---
+
+## Repository layout
+
+```
+sentinel-foundry/
+├─ sentinel_foundry.py          # launcher — opens SAR or Optical from one window
+├─ s1_pipeline_ui.py            # SAR Foundry      (Sentinel-1 GRD → COG indices)
+├─ s2_pipeline_ui.py            # Optical Foundry  (Sentinel-2 L2A → COG indices)
+├─ check_safe.py                # download integrity checker (.zip / .SAFE)
+├─ install_sentinelfoundry.py   # run once → desktop icon (Windows / macOS / Linux)
+├─ requirements.txt             # Python packages for SAR Foundry
+├─ requirements_s2.txt          # Python packages for Optical Foundry
+├─ sentinel_foundry.ico / .png  # app icon
+├─ snap_graphs/                 # built-in SNAP GPT graphs (σ⁰ standard, γ⁰ RTC)
+└─ docs/                        # project website (GitHub Pages) — index.html + assets/
+```
+
+Each tool finds its resources (graphs, requirements, icon, config) next to itself, so the layout is intentionally flat — keep these files in the same folder. The shared `.venv/` and `sar_foundry_config.json` are created at runtime and are git-ignored.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)
+
+## Funding & citation
+
+This software was developed during a PhD at the TESAF Department, University
+of Padova, funded by the European Union — **NextGenerationEU** under the
+Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
+"Education and Research", pursuant to Ministerial Decree no. 630/2024
+(*Finanziato dall'Unione europea – NextGenerationEU*).
+
+If you use Sentinel Foundry in your research, please cite it — see
+[CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" button).
+
+## 🚧 In development
+
+- **One-click installers** — standalone packages with Python and all dependencies bundled (Windows `setup.exe`, Linux `tar.gz`, macOS `dmg`), built via GitHub Actions on release tags. SNAP and GDAL remain external prerequisites. Working locally; will be activated with the first public release of this repository.
+- ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
+- **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
+- **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
+- ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*
+- ~~**Raster Calculator (S1 & S2)**~~ *(done — 🧮 Raster Calc tab in both UIs)*
+- ~~**Custom Bands (S1)**~~ *(done — Processing tab, numpy expressions with VV/VH/CR/RVI/DIFF)*
+- ~~**Custom Indices (S2)**~~ *(done — Processing tab, numpy expressions with B2–B12)*
+- ~~**Interactive AOI drawing (S1 & S2)**~~ *(done — 🗺 Draw on map button in Download tab)*
+- ~~**Select / deselect all bands**~~
+- ~~**DEM selection for Sentinel-1**~~
+- ~~**Retry failed downloads**~~
+- ~~**Configurable speckle filter**~~
+- ~~**Per-tile mosaicking for cross-MGRS AOIs (S2)**~~
+- ~~**Parallel day processing (S2)**~~
+- ~~**Real-time download speed display (S1)**~~
+- ~~**Parallel downloads (S1)**~~ *(disabled — ASF throttles parallel connections causing corrupted VV bands)*
+- ~~**ETA / elapsed time display**~~
+- ~~**Download connection resilience (S1)**~~ *(done — urllib3 retry adapter + per-scene backoff on ASF & CDSE; CDSE resume via HTTP Range)*
+- ~~**Download integrity checks (S1)**~~ *(done — fast pre-unzip zip check + post-unzip `.SAFE` validation; corrupt products deleted & logged; standalone `check_safe.py`)*
+
+---
+
+## References & acknowledgements
+
+**SAR Foundry** builds on the following tools and services:
+
+| Component | Reference |
+|-----------|-----------|
+| ESA SNAP / GPT | Zuhlke et al. (2015). *SNAP — ESA Sentinel Application Platform*. ESA Living Planet Symposium. [step.esa.int](https://step.esa.int) |
+| ASF / NASA Earthdata | Alaska Satellite Facility, NASA. [asf.alaska.edu](https://asf.alaska.edu) |
+| asf_search (Python) | ASF Tools Team. [github.com/asfadmin/Discovery-asf_search](https://github.com/asfadmin/Discovery-asf_search) |
+| rasterio | Gillies et al. (2013). *Rasterio: geospatial raster I/O for Python*. [github.com/rasterio/rasterio](https://github.com/rasterio/rasterio) |
+| GDAL | GDAL/OGR contributors (2024). *GDAL/OGR Geospatial Data Abstraction software Library*. Open Source Geospatial Foundation. [gdal.org](https://gdal.org) |
+| Copernicus DEM | ESA / Copernicus Programme. Copernicus DEM GLO-30. [spacedata.copernicus.eu](https://spacedata.copernicus.eu) |
+| σ⁰ workflow (Option A) | Filipponi, F. (2019). Sentinel-1 GRD Preprocessing Workflow. *Proceedings*, 18(1), 11. [doi:10.3390/ECRS-3-06201](https://doi.org/10.3390/ECRS-3-06201) |
+| γ⁰ RTC / Terrain-Flattening (Option B) | Small, D. (2011). Flattening Gamma: Radiometric Terrain Correction for SAR Imagery. *IEEE TGRS*, 48(8). |
+
+**Optical Foundry** builds on the following tools and services:
+
+| Component | Reference |
+|-----------|-----------|
+| EarthSearch / AWS | Element 84. *EarthSearch STAC API*. [earth-search.aws.element84.com](https://earth-search.aws.element84.com) |
+| sentinel-2-l2a-cogs | Cogeo-mosaic / AWS Open Data. [registry.opendata.aws/sentinel-2-l2a-cogs](https://registry.opendata.aws/sentinel-2-l2a-cogs) |
+| satellitetools | Junttila & Korkalainen (2021). *satellitetools*. [github.com/ollinevalainen/satellitetools](https://github.com/ollinevalainen/satellitetools) |
+| Biophysical NNs (LAI/FAPAR/FCOVER) | Baret et al. (2007); Weiss et al. (2020). ESA SNAP bioph

@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Sentinel Foundry: SAR & Optical Sentinel-1/2 processing pipelines"
+authors:
+  - family-names: Magazzino
+    given-names: Enrico
+    affiliation: "TESAF Department, University of Padova"
+    orcid: "https://orcid.org/0009-0005-5563-9391"
+license: MIT
+repository-code: "https://github.com/EnMaga/sentinel-foundry"
+version: 1.0.0
+date-released: 2026-07-03
+keywords:
+  - Sentinel-1
+  - Sentinel-2
+  - SAR
+  - remote sensing
+  - SNAP
+  - cloud-optimized GeoTIFF

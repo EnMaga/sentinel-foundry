@@ -1,0 +1,13 @@
+# Pinned to the known-good Python 3.12.10 venv (direct deps only, so the
+# Mac/Linux installs don't inherit Windows-only transitive wheels).
+# satellitetools is pinned hard: s2 monkeypatches its internals (S12).
+satellitetools==2.1.6
+rasterio==1.5.0
+rioxarray==0.22.0
+geopandas==1.1.3
+shapely==2.1.2
+numpy==2.4.6
+pandas==3.0.3
+scikit-image==0.26.0
+scipy==1.17.1
+tkcalendar==1.6.1
