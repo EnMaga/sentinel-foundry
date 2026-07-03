@@ -7,6 +7,11 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 | **SAR Foundry** | `s1_pipeline_ui.py` | Sentinel-1 GRD | ASF (NASA Earthdata) |
 | **Optical Foundry** | `s2_pipeline_ui.py` | Sentinel-2 L2A | AWS EarthSearch (public) |
 
+> 📖 **Using Sentinel Foundry in your research?** Please cite it: click
+> **"Cite this repository"** in the sidebar (APA/BibTeX from
+> [CITATION.cff](CITATION.cff)), or cite *Magazzino, E. (2026). Sentinel
+> Foundry (v1.0.0) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+
 ---
 
 ## Quick start
@@ -506,16 +511,13 @@ Each tool finds its resources (graphs, requirements, icon, config) next to itsel
 
 MIT — see [LICENSE](LICENSE)
 
-## Funding & citation
+## Funding
 
 This software was developed during a PhD at the TESAF Department, University
 of Padova, funded by the European Union — **NextGenerationEU** under the
 Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 "Education and Research", pursuant to Ministerial Decree no. 630/2024
 (*Finanziato dall'Unione europea – NextGenerationEU*).
-
-If you use Sentinel Foundry in your research, please cite it — see
-[CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" button).
 
 ## 🚧 In development
 
