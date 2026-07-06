@@ -760,18 +760,6 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
                         f"skipped {date_str}/{tile_id}: cloud {100-pct_valid:.0f}%")
                     continue
                 mask = m.astype(bool)
-                # restrict to the field polygons (nodata outside) when in fields mode
-                if field_geoms:
-                    try:
-                        from rasterio.features import geometry_mask as _geom_mask
-                        import geopandas as _gpd
-                        _fg = _gpd.GeoSeries(field_geoms, crs="EPSG:4326").to_crs(target_crs)
-                        _fmask = _geom_mask(list(_fg.geometry.values),
-                                            out_shape=(ref_10m.shape[-2], ref_10m.shape[-1]),
-                                            transform=ref_10m.rio.transform(), invert=True)
-                        mask = mask & _fmask
-                    except Exception as _fe:
-                        step_errors.append(f"field-mask ({date_str}/{tile_id}): {_fe}")
                 # save SCL raster (with tile tag)
                 try:
                     arr_scl = scl_arr[np.newaxis].astype(np.uint8)
@@ -793,6 +781,22 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
                     step_errors.append(f"SCL save ({date_str}/{tile_id}): {e}")
             except Exception as e:
                 step_errors.append(f"SCL mask ({date_str}/{tile_id}): {e}")
+
+        # restrict to the field polygons (nodata outside) when in fields mode.
+        # MUST run even if SCL was absent or its processing failed above —
+        # otherwise a cluster is written as its full bounding box instead of the
+        # field shapes, silently defeating the scattered-fields feature.
+        if field_geoms:
+            try:
+                from rasterio.features import geometry_mask as _geom_mask
+                import geopandas as _gpd
+                _fg = _gpd.GeoSeries(field_geoms, crs="EPSG:4326").to_crs(target_crs)
+                _fmask = _geom_mask(list(_fg.geometry.values),
+                                    out_shape=(ref_10m.shape[-2], ref_10m.shape[-1]),
+                                    transform=ref_10m.rio.transform(), invert=True)
+                mask = _fmask if mask is None else (mask & _fmask)
+            except Exception as _fe:
+                step_errors.append(f"field-mask ({date_str}/{tile_id}): {_fe}")
 
         def _write(da, index_name, _ref=ref_10m, _mask=mask):
             d = os.path.join(out_dir, f"index={index_name}/aoi={aoi_label}")
