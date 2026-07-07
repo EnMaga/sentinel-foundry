@@ -336,6 +336,15 @@ def _ensure_env(key, set_status):
 
 class App(tk.Tk):
     def __init__(self):
+        # Give the process its own AppUserModelID so the Windows taskbar uses
+        # this window's icon (the compass) instead of Tk's default feather.
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "SentinelFoundry.Launcher")
+            except Exception:
+                pass
         super().__init__()
         self.title("Sentinel Foundry")
         self.configure(bg=BG)
@@ -346,13 +355,14 @@ class App(tk.Tk):
         except Exception:
             pass
         try:
-            _ico = os.path.join(_DIR, "sentinel_foundry.ico")
-            _png = os.path.join(_DIR, "sentinel_foundry.png")
+            _base = getattr(sys, "_MEIPASS", _DIR)  # bundled assets live in _MEIPASS when frozen
+            _ico = os.path.join(_base, "sentinel_foundry.ico")
+            _png = os.path.join(_base, "sentinel_foundry.png")
             if os.name == "nt" and os.path.isfile(_ico):
-                self.iconbitmap(default=_ico)
-            elif os.path.isfile(_png):
+                self.iconbitmap(default=_ico)              # crisp multi-res title-bar icon
+            if os.path.isfile(_png):
                 self._iconimg = tk.PhotoImage(file=_png)   # keep ref so it's not GC'd
-                self.iconphoto(True, self._iconimg)
+                self.iconphoto(True, self._iconimg)        # reliable taskbar icon
         except Exception:
             pass
         self._status = tk.StringVar(value="")
