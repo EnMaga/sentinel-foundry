@@ -557,7 +557,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 | GDAL | GDAL/OGR contributors (2024). *GDAL/OGR Geospatial Data Abstraction software Library*. Open Source Geospatial Foundation. [gdal.org](https://gdal.org) |
 | Copernicus DEM | ESA / Copernicus Programme. Copernicus DEM GLO-30. [spacedata.copernicus.eu](https://spacedata.copernicus.eu) |
 | σ⁰ workflow (Option A) | Filipponi, F. (2019). Sentinel-1 GRD Preprocessing Workflow. *Proceedings*, 18(1), 11. [doi:10.3390/ECRS-3-06201](https://doi.org/10.3390/ECRS-3-06201) |
-| γ⁰ RTC / Terrain-Flattening (Option B) | Small, D. (2011). Flattening Gamma: Radiometric Terrain Correction for SAR Imagery. *IEEE TGRS*, 48(8). |
+| γ⁰ RTC / Terrain-Flattening (Option B) | Small, D. (2011). Flattening Gamma: Radiometric Terrain Correction for SAR Imagery. *IEEE TGRS*, 49(8), 3081-3093. doi:10.1109/TGRS.2011.2120616 |
 
 **Optical Foundry** builds on the following tools and services:
 
@@ -565,5 +565,5 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 |-----------|-----------|
 | EarthSearch / AWS | Element 84. *EarthSearch STAC API*. [earth-search.aws.element84.com](https://earth-search.aws.element84.com) |
 | sentinel-2-l2a-cogs | Cogeo-mosaic / AWS Open Data. [registry.opendata.aws/sentinel-2-l2a-cogs](https://registry.opendata.aws/sentinel-2-l2a-cogs) |
-| satellitetools | Junttila & Korkalainen (2021). *satellitetools*. [github.com/ollinevalainen/satellitetools](https://github.com/ollinevalainen/satellitetools) |
+| satellitetools | Nevalainen, O. (2022). *ollinevalainen/satellitetools: v1.0.0* [software]. Zenodo. doi:10.5281/zenodo.5993292. [github.com/ollinevalainen/satellitetools](https://github.com/ollinevalainen/satellitetools) |
 | Biophysical NNs (LAI/FAPAR/FCOVER) | Baret et al. (2007); Weiss et al. (2020). ESA SNAP bioph
