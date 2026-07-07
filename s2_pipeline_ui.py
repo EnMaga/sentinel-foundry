@@ -1105,7 +1105,13 @@ def _process_day(aoi_wkt, aoi_label, sd, ed, target_crs, out_dir, max_cloud, sel
         suffix  = f" ({n_tiles} tiles mosaicked)" if n_tiles > 1 else ""
         return f"{n} outputs in {_time.time()-t0:.0f}s{suffix}"
     if step_errors:
-        return "WARN: " + " | ".join(step_errors[:4])
+        # Found scenes but wrote NOTHING while hitting errors → the output disk
+        # is the likely cause (unplugged drive → WinError 433, disk full, denied
+        # permissions). Raise so _run_day queues the day for retry instead of
+        # silently downgrading it to a WARN that never re-runs.
+        # ponytail: partial-write disk failures (n>0 + errors) still WARN — add a
+        #           per-write OSError flag if that turns out to matter.
+        raise RuntimeError("wrote 0 files — " + " | ".join(step_errors[:4]))
     if tile_sats:
         return "scene(s) found but 0% valid pixels after SCL mask"
     return None
@@ -1421,6 +1427,9 @@ class App(tk.Tk):
                                    pady=10, font=(_FONT_FAM, 10, "bold"),
                                    state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT)
+        self._btn(footer, "📋  Run history", self._show_history,
+                  color=BG2, font=(_FONT_FAM, 9), pady=4
+                  ).pack(fill=tk.X, padx=8, pady=(0, 6))
 
         # ── notebook ─────────────────────────────────────────────────────────
         style = ttk.Style()
@@ -2369,6 +2378,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "out_dir", "output_crs", "max_workers", "retry_failed", "max_retries",
             "overwrite", "cluster_aoi", "cluster_gap_km", "fields_path")})
 
+        self._last_cfg = dict(cfg)   # snapshot for the run-history log
         self._running = True
         self._stop_event.clear()
         self._pipeline_start = time.time()
@@ -2390,7 +2400,68 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._running = False
         self._stop_event.set()
 
+    def _show_history(self):
+        import json as _json
+        hist_path = os.path.join(_SCRIPT_DIR, "optical_foundry_history.json")
+        if not os.path.isfile(hist_path):
+            messagebox.showinfo("Run history", "No runs recorded yet."); return
+        try:
+            history = _json.loads(open(hist_path, encoding="utf-8").read())
+        except Exception:
+            messagebox.showerror("Run history", "Could not read history file."); return
+        win = tk.Toplevel(self); win.title("Run History")
+        win.configure(bg=BG); win.geometry("660x400")
+        tk.Label(win, text="Last 50 pipeline runs", font=FONT_BOLD,
+                 bg=BG, fg=ACCENT_L).pack(anchor="w", padx=10, pady=(8, 4))
+        hdr = f"{'Time':<18}{'St':<4}{'AOI':<20}{'Dates':<26}{'Cloud'}"
+        tk.Label(win, text=hdr, font=FONT_MONO, bg=BG, fg=FG2,
+                 anchor="w", justify="left").pack(anchor="w", padx=12)
+        list_fr = tk.Frame(win, bg=BG)
+        list_fr.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        lb = tk.Listbox(list_fr, font=FONT_MONO, bg=SURFACE, fg=FG,
+                        selectbackground=ACCENT, selectforeground=BG,
+                        relief="flat", bd=0, highlightthickness=0,
+                        activestyle="none")
+        sb = tk.Scrollbar(list_fr, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for h in history:
+            _dates = f"{h.get('start_date','?')} → {h.get('end_date','?')}"
+            lb.insert(tk.END,
+                f"{str(h.get('timestamp','?')):<18}"
+                f"{('✓' if h.get('success') else '✗'):<4}"
+                f"{str(h.get('aoi','?'))[:19]:<20}"
+                f"{_dates:<26}"
+                f"{h.get('cloud','?')}%")
+
     def _on_done(self, success):
+        # ── append to run history (last 50) ──────────────────────────────
+        try:
+            import json as _json
+            from datetime import datetime as _dt
+            hist_path = os.path.join(_SCRIPT_DIR, "optical_foundry_history.json")
+            history = []
+            if os.path.isfile(hist_path):
+                try:
+                    history = _json.loads(open(hist_path, encoding="utf-8").read())
+                except Exception:
+                    history = []
+            c = getattr(self, "_last_cfg", {})
+            history.insert(0, {
+                "timestamp":  _dt.now().strftime("%Y-%m-%d %H:%M"),
+                "success":    success,
+                "aoi":        os.path.basename(c.get("aoi_path", "?")),
+                "start_date": c.get("start_date", "?"),
+                "end_date":   c.get("end_date", "?"),
+                "cloud":      c.get("max_cloud", "?"),
+                "out_dir":    c.get("out_dir", "?"),
+            })
+            with open(hist_path, "w", encoding="utf-8") as _f:
+                _json.dump(history[:50], _f, indent=2)
+        except Exception:
+            pass
+
         def _u():
             self._running = False
             self.btn_run.configure(state=tk.NORMAL, bg=ACCENT)
