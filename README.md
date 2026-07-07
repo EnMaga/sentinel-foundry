@@ -10,7 +10,7 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 > 📖 **Using Sentinel Foundry in your research?** Please cite it: click
 > **"Cite this repository"** in the sidebar (APA/BibTeX from
 > [CITATION.cff](CITATION.cff)), or cite *Magazzino, E. (2026). Sentinel
-> Foundry (v1.0.0) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+> Foundry (v1.0.4) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
 
 ---
 
