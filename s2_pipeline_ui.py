@@ -1100,6 +1100,16 @@ def _process_day(aoi_wkt, aoi_label, sd, ed, target_crs, out_dir, max_cloud, sel
 
     gc.collect()
     n = len(all_written)
+    # A dropped tile download (transient TLS/network) is tagged "… fetch: …".
+    # Re-queue the whole day for retry even when other tiles succeeded (n>0),
+    # otherwise a partial mosaic silently loses that tile forever. Keyed on
+    # "fetch:" so deterministic post-download errors (SCL mask, index calc)
+    # don't loop pointlessly — they'd never succeed on retry.
+    fetch_fail = [e for e in step_errors if "fetch:" in e]
+    if fetch_fail:
+        raise RuntimeError(
+            f"{n} file(s) written but {len(fetch_fail)} tile fetch(es) failed — "
+            + " | ".join(fetch_fail[:4]))
     if n:
         n_tiles = len(tile_sats)
         suffix  = f" ({n_tiles} tiles mosaicked)" if n_tiles > 1 else ""
@@ -1109,8 +1119,6 @@ def _process_day(aoi_wkt, aoi_label, sd, ed, target_crs, out_dir, max_cloud, sel
         # is the likely cause (unplugged drive → WinError 433, disk full, denied
         # permissions). Raise so _run_day queues the day for retry instead of
         # silently downgrading it to a WARN that never re-runs.
-        # ponytail: partial-write disk failures (n>0 + errors) still WARN — add a
-        #           per-write OSError flag if that turns out to matter.
         raise RuntimeError("wrote 0 files — " + " | ".join(step_errors[:4]))
     if tile_sats:
         return "scene(s) found but 0% valid pixels after SCL mask"
