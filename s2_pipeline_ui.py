@@ -128,6 +128,13 @@ FONT_MONO = ("Consolas", 9)
 
 NODATA = -9999.0
 
+# Sentinel returned by _process_day when a tile footprint overlaps the AOI but no
+# pixels actually cover it (swath/orbit edge). Used verbatim so _run_day can
+# collapse N identical per-cluster results into one line.
+_NO_PIXELS_MSG = ("tile footprint matched but no pixels cover this AOI on this date "
+                  "(no S2 acquisition here — try a wider date range; S2 revisits "
+                  "every ~5 days)")
+
 _SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_FILE = os.path.join(_SCRIPT_DIR, "optical_foundry_config.json")
 
@@ -402,6 +409,7 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             ed = (pd.to_datetime(sd) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
             try:
                 _parts = []
+                _ran   = []
                 for sub in sub_aois:
                     if stop_event and stop_event.is_set():
                         break
@@ -411,11 +419,16 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
                                      overwrite=cfg.get("overwrite", False),
                                      custom_indices=cfg.get("custom_indices", []),
                                      field_geoms=sub["fields"])
-                    if r:
+                    if r is not None:
+                        _ran.append(r)
                         _parts.append(f"{sub['tag'] or 'AOI'}: {r}")
-                result = "; ".join(_parts) if _parts else None
-                if result:
-                    log(f"  {sd}: {result}")
+                # collapse the common case where EVERY cluster that ran hit the
+                # footprint-matched-but-no-pixels result — one line, not N copies
+                if _ran and all(r == _NO_PIXELS_MSG for r in _ran):
+                    log(f"  {sd}: no usable pixels (footprint matched, swath missed "
+                        f"the fields — S2 revisits every ~5 days)")
+                elif _parts:
+                    log(f"  {sd}: {'; '.join(_parts)}")
                 else:
                     log(f"  {sd}: no data")
             except Exception as e:
@@ -519,13 +532,21 @@ _TILE_PATCH_DONE = False            # search_s2_items monkeypatch installed once
 _TILE_PATCH_LOCK = threading.Lock()
 
 # Let GDAL auto-retry transient S3/HTTP errors when reading the COGs.
-os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "3")
-os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "2")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "5")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "3")
 
 
-def _retry(fn, attempts=3, base=1.0):
-    """Call fn() with exponential back-off on transient errors (1s, 2s, 4s).
-    Re-raises the last error if all attempts fail."""
+def _retry(fn, attempts=5, base=1.0, cap=20.0):
+    """Call fn() with exponential back-off + jitter on transient errors.
+    Re-raises the last error if all attempts fail.
+
+    Needs to be generous: on Windows, many day-threads opening TLS connections
+    to AWS at once make schannel intermittently fail the handshake ("schannel:
+    failed to receive handshake", "UNEXPECTED_EOF_WHILE_READING", "Read failed").
+    These are transient — more attempts and jittered back-off (so parallel
+    threads don't all retry in lockstep and re-collide) ride them out. Waits are
+    ~1,2,4,8s capped at 20s, each ±25% jittered."""
+    import random
     last = None
     for i in range(attempts):
         try:
@@ -533,7 +554,8 @@ def _retry(fn, attempts=3, base=1.0):
         except Exception as e:
             last = e
             if i < attempts - 1:
-                time.sleep(base * (2 ** i))
+                delay = min(cap, base * (2 ** i))
+                time.sleep(delay * random.uniform(0.75, 1.25))
     raise last
 
 
@@ -650,6 +672,38 @@ def _valid_raster(path, min_bands=1):
         return False
 
 
+# SCL classes: 0 NO_DATA, 1 SATURATED/DEFECTIVE, 2 DARK, 3 CLOUD_SHADOW,
+# 4 VEGETATION, 5 BARE_SOIL, 6 WATER, 7 UNCLASSIFIED, 8 CLOUD_MED, 9 CLOUD_HIGH,
+# 10 THIN_CIRRUS, 11 SNOW/ICE.
+_SCL_KEEP  = (2, 4, 5, 6, 7)              # usable surface
+_SCL_CLOUD = (1, 3, 8, 9, 10, 11)         # real cloud/shadow/snow/defective
+
+
+def _scl_valid_mask(scl_arr):
+    """Boolean 'keep' mask from a (possibly reprojected) SCL raster.
+
+    Everything that is neither a keep-class nor a real cloud-class is treated as
+    NODATA — SCL class 0 AND any fill value introduced upstream. satellitetools
+    stamps its own fill (99) and a cross-zone reproject_match adds another
+    (e.g. -32768 / 255). NODATA must NOT be lumped into 'cloud': on a small
+    cross-zone window the valid data is a tiny island ringed by that fill, and
+    binary_fill_holes would treat the island as a hole and fill it back to cloud
+    — wiping every field (the "0% valid seam" bug). Deriving nodata by exclusion
+    is robust to whatever fill value actually appears."""
+    import numpy as np
+    from skimage.morphology import remove_small_objects, closing, square
+    from scipy.ndimage import binary_fill_holes
+    keep   = np.isin(scl_arr, _SCL_KEEP)
+    cloudy = np.isin(scl_arr, _SCL_CLOUD)
+    nodata = ~keep & ~cloudy               # class 0 + all fill (99, -32768, …)
+    cloud = cloudy
+    cloud = remove_small_objects(cloud, min_size=49)
+    cloud = binary_fill_holes(cloud)
+    cloud = closing(cloud, square(3))
+    cloud = remove_small_objects(cloud, min_size=47)
+    return (~cloud) & (~nodata)
+
+
 def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
                           tile_id, sat_letter, target_crs, out_dir,
                           max_cloud, selected, overwrite=False, single_tile=True,
@@ -702,6 +756,15 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
 
     times = ds_ms.time.values if hasattr(ds_ms, "time") else [None]
 
+    # True native CRS of the source granule. satellitetools returns pixels in the
+    # granule's own UTM zone (e.g. EPSG:32634 for tile 34TGR) with x/y coords in
+    # that zone, but stamps the CRS only in ds.attrs["crs"] — the band DataArrays
+    # carry no rio CRS. We MUST write this native CRS before reprojecting to
+    # target_crs; stamping target_crs directly (the old bug) relabels cross-zone
+    # pixels without warping them, landing outputs one UTM zone (~6° lon) off.
+    src_crs     = ds_ms.attrs.get("crs", target_crs)
+    scl_src_crs = ds_scl.attrs.get("crs", src_crs) if ds_scl is not None else src_crs
+
     for t in times:
         date_str = pd.to_datetime(t).strftime("%Y%m%d") if t is not None else date_prefix
         ds_t = ds_ms.sel(time=t)
@@ -726,7 +789,7 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
             return da.astype(float)
 
         try:
-            ref_10m = _get_b("B8").rio.write_crs(target_crs).rio.reproject(
+            ref_10m = _get_b("B8").rio.write_crs(src_crs).rio.reproject(
                 target_crs, resolution=10)
         except Exception as e:
             step_errors.append(f"ref_10m failed ({date_str}/{tile_id}): {e}")
@@ -736,8 +799,6 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
         mask = None
         if ds_scl is not None:
             try:
-                from skimage.morphology import remove_small_objects, closing, square
-                from scipy.ndimage import binary_fill_holes
                 scl_t = ds_scl.sel(time=t)
                 if "SCL" in scl_t.data_vars:
                     scl_da = scl_t["SCL"].squeeze()
@@ -745,15 +806,9 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
                     scl_da = scl_t["band_data"].squeeze()
                 else:
                     raise KeyError("SCL not found")
-                scl_10m = scl_da.rio.write_crs(target_crs).rio.reproject_match(ref_10m)
+                scl_10m = scl_da.rio.write_crs(scl_src_crs).rio.reproject_match(ref_10m)
                 scl_arr = scl_10m.values
-                m = np.isin(scl_arr, [2, 4, 5, 6, 7])
-                cloud = ~m
-                cloud = remove_small_objects(cloud, min_size=49)
-                cloud = binary_fill_holes(cloud)
-                cloud = closing(cloud, square(3))
-                cloud = remove_small_objects(cloud, min_size=47)
-                m = ~cloud
+                m = _scl_valid_mask(scl_arr)
                 pct_valid = m.sum() / m.size * 100
                 if max_cloud > 0 and (100 - pct_valid) > max_cloud:
                     step_errors.append(
@@ -795,6 +850,19 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
                                     out_shape=(ref_10m.shape[-2], ref_10m.shape[-1]),
                                     transform=ref_10m.rio.transform(), invert=True)
                 mask = _fmask if mask is None else (mask & _fmask)
+                # Cross-zone regression guard: when the source granule's UTM zone
+                # differs from the target tile's zone, a missing warp silently
+                # lands pixels a full zone (~6° lon) away. The field polygons
+                # define the AOI, so after a correct warp at least some must fall
+                # inside the raster grid. Zero + cross-zone == the misprojection
+                # bug — fail the tile loudly instead of writing a mislocated file.
+                if (str(src_crs).upper() != str(target_crs).upper()
+                        and not _fmask.any()):
+                    step_errors.append(
+                        f"CROSS-ZONE MISPROJECTION ({date_str}/{tile_id}): source "
+                        f"{src_crs} → target {target_crs}, but 0 field polygons fall "
+                        f"within the raster extent after warp — aborting tile")
+                    continue
             except Exception as _fe:
                 step_errors.append(f"field-mask ({date_str}/{tile_id}): {_fe}")
 
@@ -812,7 +880,7 @@ def _process_single_tile(sattools, aws_mod, S2Band, geom, aoi_label, sd, ed,
             if os.path.isfile(path) and not overwrite and _valid_raster(path):
                 written_paths.append(path)
                 return
-            da = da.rio.write_crs(target_crs).rio.reproject_match(_ref)
+            da = da.rio.write_crs(src_crs).rio.reproject_match(_ref)
             if _mask is not None:
                 da = da.where(_mask, NODATA)
             da = da.rio.write_nodata(NODATA)
@@ -1121,7 +1189,11 @@ def _process_day(aoi_wkt, aoi_label, sd, ed, target_crs, out_dir, max_cloud, sel
         # silently downgrading it to a WARN that never re-runs.
         raise RuntimeError("wrote 0 files — " + " | ".join(step_errors[:4]))
     if tile_sats:
-        return "scene(s) found but 0% valid pixels after SCL mask"
+        # A tile whose FOOTPRINT overlaps the AOI can still carry no pixels over
+        # it: Sentinel-2 revisits a given spot only every ~5 days, so on an
+        # off-date the granule is all NODATA (SCL=99) here. That is "no
+        # acquisition", not "all cloud".
+        return _NO_PIXELS_MSG
     return None
 
 
@@ -1287,6 +1359,15 @@ def _s2_raster_calc_worker(input_folder, expr_str, band_name_out, output_folder,
 
 class App(tk.Tk):
     def __init__(self):
+        # Distinct AppUserModelID so the Windows taskbar gives this window its own
+        # icon instead of grouping it under pythonw.exe (the default feather).
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "SentinelFoundry.Optical")
+            except Exception:
+                pass
         super().__init__()
         self.title("Optical Foundry")
         self.configure(bg=BG)
@@ -1296,12 +1377,21 @@ class App(tk.Tk):
         self._stop_event = threading.Event()
         self._dep_results = {}
         self._saved_cfg = _load_config()
+        # restore the previous run's output selection (None on first run → all on)
+        _sel = self._saved_cfg.get("selected_outputs")
+        self._sel_set = set(_sel) if _sel is not None else None
 
+        # Icon: the multi-res .ico MUST be set first — it carries the large sizes
+        # the Windows taskbar uses; the .png iconphoto then covers the title bar
+        # and non-Windows. (base64 64px alone left the taskbar on pythonw's icon.)
         try:
-            import base64
-            _icon = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACH0lEQVR4nO2ZsVICMRCGNw6Vr4JQSgkz+A5cCQ6NA0+AtTwBjg0Dlsc74AyWWCq+ipUzscDETO5Ukuwm6O1XXTKQ/fe/zV4OABiGYRiGYZhqIlIFllJKe04IEV1PLXZAgH3yq6fr0vnYJkR33Ey+d36j5825mCZENcBO3qwCcxzThJMYQWzs5AH2FWBWRCySGHBMsAEpgpaVe9m2iAE/BWIFMvnuHBA7eQA+CaZHfpIqPj8FUgtIDfmewyhvyt5A+jYopZSNfhNlHSoTyLYAVvIAAI1+E6WSyigYoLryLu9KE5cxhVBbn69OW1+hrKSUcrzswNVpDe7e3vX8oePZYANCCIFZAQAAL/fPet3xsuOsS6H0qXHlnwJsQGoBqSExgKoRUqxbaIK7vBsUpN5b62vsJqh4XV0ErXWWPei8Cwehem8NQU8BAN2tg1SWoNb10aWYDTYA2dd95x6QWkBqKm9A6UkQYN9ozIbmMqY+CZrzrjqVPn2NprAELBNU8giSClT+94DkUL89/kblmyAb4PLhfDsZUgnBhFQn9uLYPSDKTcIMgmmAj66kPWC0aMvxsgOjRftv/TOUtabz0Cqwkw41Id9OhllrOnf9nncFYJiAhW/yAIFb4BhMCEkeAOkorExwFWKW/e3lo5MW35ikxKqG1FX3I/l2MqQSSLk2OphiKRMnf820hR+yZ32+40v09+xD7uRRNTaGYRiG+b98ABNl3hsC7VODAAAAAElFTkSuQmCC"
-            img = tk.PhotoImage(data=_icon)
-            self.iconphoto(True, img)
+            _ico = os.path.join(_SCRIPT_DIR, "sentinel_foundry.ico")
+            _png = os.path.join(_SCRIPT_DIR, "sentinel_foundry.png")
+            if os.name == "nt" and os.path.isfile(_ico):
+                self.iconbitmap(default=_ico)
+            if os.path.isfile(_png):
+                self._iconimg = tk.PhotoImage(file=_png)
+                self.iconphoto(True, self._iconimg)
         except Exception:
             pass
 
@@ -1611,7 +1701,7 @@ class App(tk.Tk):
                   color=BG2, font=(_FONT_FAM, 9)).pack(side=tk.LEFT)
         bp_fr = tk.Frame(p, bg=BG); bp_fr.pack(padx=14, pady=2, anchor="w")
         for b in BIOPHYS:
-            self.v_biophys[b] = tk.BooleanVar(value=True)
+            self.v_biophys[b] = tk.BooleanVar(value=(self._sel_set is None or b in self._sel_set))
             tk.Checkbutton(bp_fr, text=f"{b:<8}  {BIOPHYS_DESC.get(b, '')}",
                            variable=self.v_biophys[b],
                            bg=BG, fg=FG, selectcolor=BG2,
@@ -1629,7 +1719,7 @@ class App(tk.Tk):
                   color=BG2, font=(_FONT_FAM, 9)).pack(side=tk.LEFT)
         bands_fr = tk.Frame(p, bg=BG); bands_fr.pack(padx=14, pady=4, anchor="w")
         for i, b in enumerate(BANDS):
-            self.v_bands[b] = tk.BooleanVar(value=True)
+            self.v_bands[b] = tk.BooleanVar(value=(self._sel_set is None or b in self._sel_set))
             tk.Checkbutton(bands_fr, text=b, variable=self.v_bands[b],
                            bg=BG, fg=FG, selectcolor=BG2,
                            activebackground=BG, activeforeground=ACCENT_L,
@@ -1647,7 +1737,7 @@ class App(tk.Tk):
                   color=BG2, font=(_FONT_FAM, 9)).pack(side=tk.LEFT)
         idx_fr = tk.Frame(p, bg=BG); idx_fr.pack(padx=14, pady=2, anchor="w")
         for idx in INDICES:
-            self.v_idx[idx] = tk.BooleanVar(value=True)
+            self.v_idx[idx] = tk.BooleanVar(value=(self._sel_set is None or idx in self._sel_set))
             tk.Checkbutton(idx_fr, text=f"{idx:<8}  {INDICES_DESC.get(idx, '')}",
                            variable=self.v_idx[idx],
                            bg=BG, fg=FG, selectcolor=BG2,
@@ -1659,12 +1749,14 @@ class App(tk.Tk):
         _hint("Write a numpy expression using B2 B3 B4 B5 B6 B7 B8 B8A B11 B12.")
         _hint("Example: (B8 - B4) / (B8 + B4 + 1e-9)   →  save as  MyNDVI")
         self.v_custom_idx = []   # list of (enabled_BoolVar, name_StringVar, expr_StringVar)
+        _saved_ci = self._saved_cfg.get("custom_indices", []) or []
         for i in range(3):
             row = tk.Frame(p, bg=BG)
             row.pack(padx=14, pady=3, fill=tk.X)
-            en_var   = tk.BooleanVar(value=False)
-            name_var = tk.StringVar(value="")
-            expr_var = tk.StringVar(value="")
+            _ci = _saved_ci[i] if i < len(_saved_ci) else {}
+            en_var   = tk.BooleanVar(value=bool(_ci.get("name") and _ci.get("expr")))
+            name_var = tk.StringVar(value=_ci.get("name", ""))
+            expr_var = tk.StringVar(value=_ci.get("expr", ""))
             tk.Checkbutton(row, text="", variable=en_var,
                            bg=BG, fg=FG, selectcolor=BG2,
                            activebackground=BG, activeforeground=ACCENT_L)\
@@ -1867,6 +1959,10 @@ class App(tk.Tk):
             _r = tk.Frame(prog_frame, bg=SURFACE); _r.pack(fill=tk.X, pady=1)
             tk.Label(_r, text=f"{_lbl}:", font=(_FONT_FAM, 8, "bold"),
                      bg=SURFACE, fg=FG2, width=11, anchor="w").pack(side=tk.LEFT)
+            # live ETA pinned to the far RIGHT of the bar, in red (SAR-style)
+            _stat = tk.StringVar(value="")
+            tk.Label(_r, textvariable=_stat, font=FONT_MONO,
+                     bg=SURFACE, fg=RED, width=14, anchor="e").pack(side=tk.RIGHT, padx=(4, 6))
             _bar = ttk.Progressbar(_r, mode="determinate", maximum=100, value=0)
             _bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
             _cnt = tk.StringVar(value="")
@@ -1875,17 +1971,14 @@ class App(tk.Tk):
             _txt = tk.StringVar(value="")
             tk.Label(_r, textvariable=_txt, font=FONT_MONO,
                      bg=SURFACE, fg=FG2, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self._prog_bars[_phase] = (_bar, _cnt, _txt)
+            self._prog_bars[_phase] = (_bar, _cnt, _txt, _stat)
 
         # ETA row — above the progress bars so it's always visible
         eta_row = tk.Frame(parent, bg=SURFACE)
         eta_row.pack(fill=tk.X, padx=8, pady=(4, 2))
-        self._eta_var     = tk.StringVar(value="")
         self._elapsed_var = tk.StringVar(value="")
         tk.Label(eta_row, textvariable=self._elapsed_var,
                  font=FONT_MONO, bg=SURFACE, fg=FG2, anchor="w").pack(side=tk.LEFT)
-        tk.Label(eta_row, textvariable=self._eta_var,
-                 font=FONT_MONO, bg=SURFACE, fg=ACCENT_L, anchor="e").pack(side=tk.RIGHT)
 
         # overall indeterminate spinner
         self.progress = ttk.Progressbar(parent, mode="indeterminate")
@@ -1896,13 +1989,13 @@ class App(tk.Tk):
         def _do():
             if not hasattr(self, "_prog_bars") or phase not in self._prog_bars:
                 return
-            bar, cnt_var, txt_var = self._prog_bars[phase]
+            bar, cnt_var, txt_var, stat_var = self._prog_bars[phase]
             pct = (current / total * 100) if total > 0 else 0
             bar["value"] = pct
             cnt_var.set(f"{current}/{total}" if total > 0 else "")
             txt_var.set(label[:40] if label else "")
 
-            # ── ETA + elapsed ──────────────────────────────────────────────
+            # ── ETA (red, pinned right of the bar) + elapsed ────────────────
             if not hasattr(self, "_pipeline_start") or not self._pipeline_start:
                 return
             elapsed = time.time() - self._pipeline_start
@@ -1917,22 +2010,22 @@ class App(tk.Tk):
 
             if current > 0 and total > current:
                 eta_secs = (elapsed / current) * (total - current)
-                self._eta_var.set(f"ETA: ~{_fmt(eta_secs)}")
+                stat_var.set(f"ETA ~{_fmt(eta_secs)}")
             elif current >= total > 0:
-                self._eta_var.set("✓ Done")
+                stat_var.set("✓ done")
             else:
-                self._eta_var.set("")
+                stat_var.set("")
 
         self.after(0, _do)
 
     def _reset_all_progress(self):
         if not hasattr(self, "_prog_bars"):
             return
-        for bar, cnt_var, txt_var in self._prog_bars.values():
+        for bar, cnt_var, txt_var, stat_var in self._prog_bars.values():
             bar["value"] = 0
             cnt_var.set("")
             txt_var.set("")
-        if hasattr(self, "_eta_var"):     self._eta_var.set("")
+            stat_var.set("")
         if hasattr(self, "_elapsed_var"): self._elapsed_var.set("")
         self._pipeline_start = None
 
@@ -2384,7 +2477,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         _save_config({k: cfg[k] for k in (
             "aoi_path", "start_date", "end_date", "max_cloud",
             "out_dir", "output_crs", "max_workers", "retry_failed", "max_retries",
-            "overwrite", "cluster_aoi", "cluster_gap_km", "fields_path")})
+            "overwrite", "cluster_aoi", "cluster_gap_km", "fields_path",
+            "selected_outputs", "custom_indices")})
 
         self._last_cfg = dict(cfg)   # snapshot for the run-history log
         self._running = True
@@ -2485,8 +2579,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                     return f"{s//3600}h {(s%3600)//60:02d}m"
                 if hasattr(self, "_elapsed_var"):
                     self._elapsed_var.set(f"Total: {_fmt(elapsed)}")
-            if hasattr(self, "_eta_var"):
-                self._eta_var.set("✓ Done" if success else "■ Stopped")
+            # final status on the bar's (red) stat label
+            if getattr(self, "_prog_bars", None) and "process" in self._prog_bars:
+                self._prog_bars["process"][3].set("✓ done" if success else "■ stopped")
         self.after(0, _u)
 
 

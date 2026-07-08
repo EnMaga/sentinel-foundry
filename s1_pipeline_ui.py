@@ -3043,16 +3043,37 @@ def _clean_safe(safe_dir, log):
 
 class App(tk.Tk):
     def __init__(self):
+        # Distinct AppUserModelID so the Windows taskbar gives this window its own
+        # icon instead of grouping it under pythonw.exe (the default feather).
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "SentinelFoundry.Sar")
+            except Exception:
+                pass
         super().__init__()
         self.title("SAR Foundry")
         self.configure(bg=BG)
 
-        # set satellite icon
+        # Icon: the multi-res .ico MUST be set first — it carries the large sizes
+        # the Windows taskbar uses; the .png iconphoto then covers the title bar
+        # and non-Windows. (base64 64px alone left the taskbar on pythonw's icon.)
         try:
-            import base64 as _b64
-            _icon_data = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAACH0lEQVR4nO2ZsVICMRCGNw6Vr4JQSgkz+A5cCQ6NA0+AtTwBjg0Dlsc74AyWWCq+ipUzscDETO5Ukuwm6O1XXTKQ/fe/zV4OABiGYRiGYZhqIlIFllJKe04IEV1PLXZAgH3yq6fr0vnYJkR33Ey+d36j5825mCZENcBO3qwCcxzThJMYQWzs5AH2FWBWRCySGHBMsAEpgpaVe9m2iAE/BWIFMvnuHBA7eQA+CaZHfpIqPj8FUgtIDfmewyhvyt5A+jYopZSNfhNlHSoTyLYAVvIAAI1+E6WSyigYoLryLu9KE5cxhVBbn69OW1+hrKSUcrzswNVpDe7e3vX8oePZYANCCIFZAQAAL/fPet3xsuOsS6H0qXHlnwJsQGoBqSExgKoRUqxbaIK7vBsUpN5b62vsJqh4XV0ErXWWPei8Cwehem8NQU8BAN2tg1SWoNb10aWYDTYA2dd95x6QWkBqKm9A6UkQYN9ozIbmMqY+CZrzrjqVPn2NprAELBNU8giSClT+94DkUL89/kblmyAb4PLhfDsZUgnBhFQn9uLYPSDKTcIMgmmAj66kPWC0aMvxsgOjRftv/TOUtabz0Cqwkw41Id9OhllrOnf9nncFYJiAhW/yAIFb4BhMCEkeAOkorExwFWKW/e3lo5MW35ikxKqG1FX3I/l2MqQSSLk2OphiKRMnf820hR+yZ32+40v09+xD7uRRNTaGYRiG+b98ABNl3hsC7VODAAAAAElFTkSuQmCC"
-            _icon_img = tk.PhotoImage(data=_icon_data)
-            self.iconphoto(True, _icon_img)
+            _ico = os.path.join(_SCRIPT_DIR, "sentinel_foundry.ico")
+            _png = os.path.join(_SCRIPT_DIR, "sentinel_foundry.png")
+            if os.name == "nt" and os.path.isfile(_ico):
+                self.iconbitmap(default=_ico)
+            if os.path.isfile(_png):
+                self._iconimg = tk.PhotoImage(file=_png)
+                self.iconphoto(True, self._iconimg)
+        except Exception:
+            pass
+        # crisp multi-res title-bar + taskbar icon from the real .ico (Windows)
+        try:
+            _ico = os.path.join(_SCRIPT_DIR, "sentinel_foundry.ico")
+            if os.name == "nt" and os.path.isfile(_ico):
+                self.iconbitmap(default=_ico)
         except Exception:
             pass
         self.resizable(True, True)
