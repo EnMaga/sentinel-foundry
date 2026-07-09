@@ -42,7 +42,7 @@
   section h2{font-size:28px; margin:0 0 6px}
   section .sub{color:var(--muted); margin:0 0 26px}
   figure{margin:26px 0 0}
-  figure img{width:100%; height:auto; border:1px solid var(--line); border-radius:10px; display:block}
+  figure img,figure video{width:100%; height:auto; border:1px solid var(--line); border-radius:10px; display:block}
   figcaption{font-size:13.5px; color:var(--muted); margin-top:8px; text-align:center}
   .grid2{display:grid; grid-template-columns:1fr 1fr; gap:42px; align-items:stretch}
   .grid2 .card{height:100%}
@@ -117,7 +117,10 @@
     <p class="sub">Two focused applications, one consistent workflow.</p>
     <p>Each tool walks you through the full chain in a single window: pick an area of interest (file or drawn on a map) and a date range, download the scenes, run the scientific preprocessing, and write the results as 10&nbsp;m Cloud-Optimized GeoTIFFs ready for GIS or machine learning. Dependencies are checked up front, downloads are verified for integrity, and long jobs report live progress and ETA.</p>
     <figure>
-      <img src="assets/demo.gif?v=3" alt="Drawing an area of interest on the interactive map in SAR Foundry" loading="lazy">
+      <div class="grid2">
+        <video src="assets/demo1.mp4" autoplay loop muted playsinline preload="metadata"></video>
+        <video src="assets/demo2.mp4" autoplay loop muted playsinline preload="metadata"></video>
+      </div>
       <figcaption>Setting the area of interest — <em>Draw on map</em> opens an interactive Google-satellite basemap (SAR Foundry).</figcaption>
     </figure>
   </div>
