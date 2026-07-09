@@ -229,6 +229,19 @@ def check_dependencies(gpt_path, gdal_path=None):
     else:
         results["Python packages"] = (True, "rasterio, asf_search, geopandas, shapely, numpy, tkcalendar, psutil — all present")
 
+    # ── unzip accelerator (optional — zipfile always works as fallback) ────────
+    try:
+        _kind, _exe = _find_fast_extractor()
+    except Exception:
+        _kind, _exe = ("zipfile", None)
+    if _kind == "7z":
+        results["Unzip tool"] = (True, f"7-Zip ({_exe}) — fast native .SAFE extraction")
+    elif _kind == "tar":
+        results["Unzip tool"] = (True, f"bsdtar ({_exe}) — fast native extraction; install 7-Zip for the quickest path")
+    else:
+        results["Unzip tool"] = ("info",
+            "Python zipfile (slow on large products) — install 7-Zip for much faster unzip: https://www.7-zip.org/")
+
     return results
 
 
