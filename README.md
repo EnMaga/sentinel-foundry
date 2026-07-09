@@ -2,6 +2,8 @@
 
 Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipelines — point-and-click, self-installing, no credentials needed for S2.
 
+> 🌐 **Tutorial & screenshots:** [**enmaga.github.io/sentinel-foundry**](https://enmaga.github.io/sentinel-foundry/) — a guided, per-tab walkthrough of both apps with example outputs.
+
 | Tool | Script | Satellite | Source |
 |------|--------|-----------|--------|
 | **SAR Foundry** | `s1_pipeline_ui.py` | Sentinel-1 GRD | ASF (NASA Earthdata) |
