@@ -391,6 +391,15 @@ def _write_error(cfg, stem, phase, message):
         f.write("The scene name contains the acquisition date (YYYYMMDD).\n")
 
 
+def _clear_error(cfg, stem, phase):
+    """Delete a per-scene error log once that step succeeds, so a recovered
+    scene (esp. on retry) isn't falsely re-reported in the end-of-run summary."""
+    try:
+        os.remove(os.path.join(_error_dir(cfg), f"{stem}__{phase}.error.txt"))
+    except OSError:
+        pass
+
+
 def _pending_index_error(cfg, date, orbit):
     """True if a previous run left an unresolved indices error for this
     date/orbit, so it must be reprocessed rather than skipped."""
@@ -550,6 +559,7 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
                         _sc, safe_dir, _sess, _asf2, log, _nm, attempts=2)
                     if _ok:
                         log(f"     OK retry")
+                        _clear_error(cfg, _nm, "download")   # recovered on retry
                         progress_cb("download", _ri, len(failed_downloads), f"retry ok")
                     else:
                         log(f"     FAILED retry: {_re2}")
@@ -720,6 +730,13 @@ def _download(cfg, safe_dir, log, progress_cb=None):
     results = sorted(results, key=lambda r: r.properties.get("startTime", ""))
     log(f"Found {len(results)} scenes total")
 
+    # Retry run: keep only scenes acquired on the failed dates.
+    _retry_dates = cfg.get("retry_dates")
+    if _retry_dates:
+        results = [r for r in results
+                   if r.properties.get("startTime", "")[:10] in _retry_dates]
+        log(f"Retry filter: {len(results)} scene(s) on {len(_retry_dates)} failed date(s)")
+
     # filter by orbit direction
     orbit_filter = cfg["orbit_dir"]
     if orbit_filter != "Both":
@@ -843,6 +860,7 @@ def _download(cfg, safe_dir, log, progress_cb=None):
                 progress_cb("download", dl_done, n_dl, f"{date} {dirn} ✓ {delta_mb:.0f}MB {spd_str}",
                             speed=spd_str)
                 log(f"     ✓  {elapsed:.0f}s  {delta_mb:.0f} MB  {spd_str}")
+                _clear_error(cfg, name, "download")   # recovered — drop stale log
             else:
                 _write_error(cfg, name, "download", f"{_dl_err}")
                 log(f"     ✗ ERROR after retries: {_dl_err}")
@@ -1007,6 +1025,14 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
             break
 
     log(f"Found {len(all_items)} scenes total")
+
+    # Retry run: keep only scenes acquired on the failed dates.
+    _retry_dates = cfg.get("retry_dates")
+    if _retry_dates:
+        all_items = [it for it in all_items
+                     if it.get("ContentDate", {}).get("Start", "")[:10] in _retry_dates]
+        log(f"Retry filter: {len(all_items)} scene(s) on {len(_retry_dates)} failed date(s)")
+
     if not all_items:
         log("No scenes found — check AOI, dates and orbit selection")
         return []
@@ -1159,6 +1185,7 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                             speed=spd_str)
                 log(f"     ✓  {elapsed:.0f}s  {mb:.0f} MB  {spd_str}"
                     + ("  (resumed)" if resume_from > 0 else ""))
+                _clear_error(cfg, name, "download_cdse")   # recovered — drop stale log
                 return None
 
             except Exception as _dl_err:
@@ -4307,6 +4334,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                     f"{_dates:<26}"
                     f"{str(h.get('orbit','?')):<7}"
                     f"{h.get('speckle','?')}")
+        self._btn(footer, "↻  Retry failed downloads", self._on_retry_failed,
+                  color=GOLD, font=(_FONT_FAM, 9, "bold"), pady=4
+                  ).pack(fill=tk.X, padx=8, pady=(0, 2))
         self._btn(footer, "📋  Run history", _show_history,
                   color=BG2, font=(_FONT_FAM, 9), pady=4
                   ).pack(fill=tk.X, padx=8, pady=(0, 6))
@@ -4907,7 +4937,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             if hasattr(self, "chk_snap"):
                 self.chk_snap.configure(state=tk.NORMAL)
 
-    def _on_start(self):
+    def _on_start(self, retry_dates=None):
         if self._running:
             return
 
@@ -4945,17 +4975,19 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             return
 
         # validate dates (YYYY-MM-DD, start ≤ end) — a bad range otherwise fails
-        # silently as "0 days" or throws on the UI thread (S3)
-        import datetime as _dt
-        try:
-            _sd = _dt.datetime.strptime(self.v_start.get().strip(), "%Y-%m-%d").date()
-            _ed = _dt.datetime.strptime(self.v_end.get().strip(), "%Y-%m-%d").date()
-        except ValueError:
-            messagebox.showerror("Dates", "Dates must be in YYYY-MM-DD format.")
-            return
-        if _sd > _ed:
-            messagebox.showerror("Dates", "Start date must be on or before the end date.")
-            return
+        # silently as "0 days" or throws on the UI thread (S3).
+        # Skipped on a retry run — dates come from the logged error files.
+        if not retry_dates:
+            import datetime as _dt
+            try:
+                _sd = _dt.datetime.strptime(self.v_start.get().strip(), "%Y-%m-%d").date()
+                _ed = _dt.datetime.strptime(self.v_end.get().strip(), "%Y-%m-%d").date()
+            except ValueError:
+                messagebox.showerror("Dates", "Dates must be in YYYY-MM-DD format.")
+                return
+            if _sd > _ed:
+                messagebox.showerror("Dates", "Start date must be on or before the end date.")
+                return
 
         # validate required paths
         required_dirs = []
@@ -5113,6 +5145,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "gdal_path":         self.v_gdal.get().strip(),
             "output_crs":  self.v_crs.get().strip(),
         }
+        if retry_dates:
+            # Retry only the failed dates. Force the download step on (the whole
+            # point) and filter the scene search to those dates; SNAP/indices
+            # follow whatever is checked and skip scenes already processed.
+            cfg["retry_dates"] = set(retry_dates)
+            cfg["do_download"] = True
+
         if not cfg["aoi_path"] or not os.path.isfile(cfg["aoi_path"]):
             messagebox.showerror("AOI file missing",
                 "Please select an AOI file (.shp, .gpkg or .geojson) in section 3.")
@@ -5254,6 +5293,34 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             args=(cfg, self._log, self._on_done, self._update_progress),
             daemon=True)
         self._thread.start()
+
+    def _on_retry_failed(self):
+        """Re-run only the dates whose download failed in the last run."""
+        if self._running:
+            return
+        base = (self.v_out_dir.get().strip() or self.v_snap_dir.get().strip()
+                or self.v_safe_dir.get().strip())
+        if not base:
+            messagebox.showerror("Output missing", "Set an output folder first.")
+            return
+        edir = os.path.join(base, "pipeline_errors")
+        # Download-phase logs are named "<sceneName>__download*.error.txt"; the
+        # acquisition date is embedded in the scene name as _YYYYMMDDTHHMMSS_.
+        dates = set()
+        for p in glob.glob(os.path.join(edir, "*__download*.error.txt")):
+            m = re.search(r"_(\d{8})T\d{6}", os.path.basename(p))
+            if m:
+                d = m.group(1)
+                dates.add(f"{d[:4]}-{d[4:6]}-{d[6:]}")
+        if not dates:
+            messagebox.showinfo("Retry failed downloads",
+                "No failed downloads logged — nothing to retry.")
+            return
+        dates = sorted(dates)
+        if not messagebox.askyesno("Retry failed downloads",
+                f"Re-download {len(dates)} failed date(s)?\n\n" + "\n".join(dates)):
+            return
+        self._on_start(retry_dates=dates)
 
     def _on_stop(self):
         self._log("\n[Stopping immediately — killing running subprocess(es)…]")

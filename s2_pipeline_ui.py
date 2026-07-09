@@ -378,10 +378,15 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         log(f"AOI: {aoi_label}  |  CRS: {target_crs}")
 
         import pandas as pd
-        days = list(pd.date_range(
-            start=cfg["start_date"], end=cfg["end_date"], freq="D"
-        ).strftime("%Y-%m-%d"))
-        log(f"Date range: {cfg['start_date']} → {cfg['end_date']}  ({len(days)} days)")
+        retry_days = cfg.get("retry_days")   # explicit list → retry only these days
+        if retry_days:
+            days = list(retry_days)
+            log(f"Retry run: {len(days)} failed day(s) — {', '.join(days)}")
+        else:
+            days = list(pd.date_range(
+                start=cfg["start_date"], end=cfg["end_date"], freq="D"
+            ).strftime("%Y-%m-%d"))
+            log(f"Date range: {cfg['start_date']} → {cfg['end_date']}  ({len(days)} days)")
 
         max_cloud = cfg.get("max_cloud", 0)
         selected  = cfg.get("selected_outputs", BIOPHYS + BANDS + INDICES)
@@ -407,6 +412,16 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
                     progress_cb("process", _c, total, f"{sd} [skipped]")
                 return
             ed = (pd.to_datetime(sd) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            # Drop any stale error log from an earlier attempt so a success —
+            # especially on retry — doesn't leave the day falsely flagged in the
+            # end-of-run summary (which just globs *.error.txt). Re-written below
+            # only if THIS attempt fails.
+            _ef = os.path.join(_error_dir(cfg), f"S2_{sd.replace('-','')}__process.error.txt")
+            try:
+                if os.path.isfile(_ef):
+                    os.remove(_ef)
+            except Exception:
+                pass
             try:
                 _parts = []
                 _ran   = []
@@ -1525,6 +1540,9 @@ class App(tk.Tk):
                                    pady=10, font=(_FONT_FAM, 10, "bold"),
                                    state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT)
+        self._btn(footer, "↻  Retry failed days", self._on_retry_failed,
+                  color=GOLD, font=(_FONT_FAM, 9, "bold"), pady=4
+                  ).pack(fill=tk.X, padx=8, pady=(0, 2))
         self._btn(footer, "📋  Run history", self._show_history,
                   color=BG2, font=(_FONT_FAM, 9), pady=4
                   ).pack(fill=tk.X, padx=8, pady=(0, 6))
@@ -2411,7 +2429,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             self._log("  [Calculator stop requested]")
 
     # ── pipeline ──────────────────────────────────────────────────────────────
-    def _on_start(self):
+    def _on_start(self, retry_days=None):
         if self._running: return
         # validate
         if not self.v_aoi.get().strip():
@@ -2420,15 +2438,17 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             messagebox.showerror("AOI not found", f"File not found: {self.v_aoi.get()}"); return
         if not self.v_out.get().strip():
             messagebox.showerror("Output missing", "Please set the COG output folder."); return
-        # dates: YYYY-MM-DD and start ≤ end (else a silent "0 days" run) (S3)
-        import datetime as _dt
-        try:
-            _sd = _dt.datetime.strptime(self.v_start.get().strip(), "%Y-%m-%d").date()
-            _ed = _dt.datetime.strptime(self.v_end.get().strip(), "%Y-%m-%d").date()
-        except ValueError:
-            messagebox.showerror("Dates", "Dates must be in YYYY-MM-DD format."); return
-        if _sd > _ed:
-            messagebox.showerror("Dates", "Start date must be on or before the end date."); return
+        # dates: YYYY-MM-DD and start ≤ end (else a silent "0 days" run) (S3).
+        # Skipped on a retry run — the days come from the logged error files.
+        if not retry_days:
+            import datetime as _dt
+            try:
+                _sd = _dt.datetime.strptime(self.v_start.get().strip(), "%Y-%m-%d").date()
+                _ed = _dt.datetime.strptime(self.v_end.get().strip(), "%Y-%m-%d").date()
+            except ValueError:
+                messagebox.showerror("Dates", "Dates must be in YYYY-MM-DD format."); return
+            if _sd > _ed:
+                messagebox.showerror("Dates", "Start date must be on or before the end date."); return
         _has_custom = any(
             en.get() and name.get().strip() and expr.get().strip()
             for en, name, expr in self.v_custom_idx
@@ -2480,6 +2500,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "overwrite", "cluster_aoi", "cluster_gap_km", "fields_path",
             "selected_outputs", "custom_indices")})
 
+        if retry_days:
+            # Retry only the failed days, and force overwrite so a partial
+            # mosaic (some tiles written, one fetch dropped) rebuilds cleanly.
+            cfg["retry_days"] = list(retry_days)
+            cfg["overwrite"]  = True
+
         self._last_cfg = dict(cfg)   # snapshot for the run-history log
         self._running = True
         self._stop_event.clear()
@@ -2496,6 +2522,27 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             kwargs={"progress_cb": self._update_progress},
             daemon=True)
         self._thread.start()
+
+    def _on_retry_failed(self):
+        """Re-run only the days that left an error log from the last run."""
+        if self._running: return
+        out_dir = self.v_out.get().strip()
+        if not out_dir:
+            messagebox.showerror("Output missing", "Set the output folder first."); return
+        edir = os.path.join(out_dir, "pipeline_errors")
+        dates = sorted({
+            m.group(1)
+            for p in glob.glob(os.path.join(edir, "S2_*__process.error.txt"))
+            for m in [re.search(r"S2_(\d{8})__", os.path.basename(p))] if m
+        })
+        if not dates:
+            messagebox.showinfo("Retry failed days",
+                "No failed days logged — nothing to retry."); return
+        dates = [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in dates]
+        if not messagebox.askyesno("Retry failed days",
+                f"Re-run {len(dates)} failed day(s)?\n\n" + "\n".join(dates)):
+            return
+        self._on_start(retry_days=dates)
 
     def _on_stop(self):
         self._log("\n[Stopping — cancelling pending days (active HTTP requests will complete then exit)…]")

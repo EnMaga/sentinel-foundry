@@ -279,6 +279,10 @@ Pressing **■ STOP** immediately kills the running SNAP GPT subprocess (`Popen.
 
 If scenes fail to download, the pipeline logs the failure and continues. At the end of the run, if **Retry failed downloads at end** is enabled (section 7), the pipeline re-authenticates and retries the failed scenes.
 
+Most download failures are *transient* — a dropped TLS connection or a 5xx from the archive (`Read failed`), not a missing scene. A scene that recovers on retry no longer leaves a stale log behind: the `pipeline_errors/…__download*.error.txt` file is deleted the moment that download succeeds.
+
+**Manual retry (↻ Retry failed downloads).** If a run still ends with download errors — e.g. the archive was down and every attempt failed — click **↻ Retry failed downloads** in the footer. It reads the acquisition dates out of the leftover `…__download*.error.txt` logs, forces the download step on, and re-runs the scene search restricted to just those dates. Already-downloaded scenes are skipped, so only the missing ones are re-fetched. There's nothing to retry if `pipeline_errors/` has no download logs.
+
 ---
 
 ### Opening the app (unsigned build)
@@ -473,6 +477,18 @@ Days are processed in parallel using `ThreadPoolExecutor` (configurable 1–8 wo
 ### Retry on network errors
 
 Failed days are collected during the run. If **Retry failed days** is enabled, the pipeline waits 10 seconds then re-attempts up to the configured number of times. Useful for transient AWS S3 or EarthSearch timeouts.
+
+Nearly all of these are *transient* tile reads: a single MGRS tile drops mid-download (`… tile 34TGR/B fetch: Read failed`), so the whole day is re-queued rather than saving a mosaic with a hole in it. A day that recovers on retry no longer leaves a stale log — the day's `…__process.error.txt` is cleared at the start of each attempt and only rewritten if that attempt fails. (Previously the automatic retry could fix a day yet still list it under "days had errors" in the summary — the error log was never deleted.)
+
+**Manual retry (↻ Retry failed days).** If a run still ends with day errors, click **↻ Retry failed days** in the footer. It reads the failed dates from the leftover `S2_YYYYMMDD__process.error.txt` logs and re-runs *only* those days with overwrite on (so a partially-written mosaic is rebuilt cleanly). Nothing to retry if `pipeline_errors/` is empty.
+
+> **"no data" and "no usable pixels" are not errors — and they are two different things.** Sentinel-2 revisits a given spot only every ~5 days, and its swaths are ~290 km wide, so on most calendar dates one of these is expected:
+>
+> - **`<date>: no data`** — *nothing was acquired.* No S2 granule was even catalogued for that date over the AOI; the satellite did not image this area that day. This is the plain revisit gap, and it's the most common line by far (a ~5-day cycle means ~4 of every 5 days show it).
+> - **`<date>: no usable pixels`** / **`footprint matched but no pixels cover this AOI on this date`** — *acquired, but nothing usable landed on your fields.* A granule **was** found — its 100 km MGRS-tile footprint clips the AOI's bounding box — but after cloud/SCL masking and clipping to the actual field shapes, zero valid pixels remained (the imaged swath grazed the tile edge, or every covering pixel was cloud/NODATA).
+> - A **mixed** line like `c01: 28 outputs …; c02: footprint matched but no pixels …` just means one field cluster got usable data that day and another didn't.
+>
+> All three are skipped silently and never retried. Only a real fetch/processing failure (e.g. `tile … fetch: Read failed`) writes to `pipeline_errors/`.
 
 ---
 
