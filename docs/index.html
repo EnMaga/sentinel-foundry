@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel Foundry — analysis-ready Sentinel-1 &amp; Sentinel-2</title>
+<meta name="description" content="Open-source desktop tools that turn Sentinel-1 GRD and Sentinel-2 L2A imagery into analysis-ready Cloud-Optimized GeoTIFF indices, with a guided GUI built on ESA SNAP and GDAL.">
+<style>
+  :root{
+    --ink:#e6edf3; --muted:#8b949e; --line:#30363d; --bg:#0d1117; --soft:#161b22;
+    --sar:#ff7b72; --opt:#4493f8; --accent:#4493f8;
+    --green:#238636; --green-h:#2ea043;
+    --maxw:960px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; color:var(--ink); background:var(--bg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6; font-size:17px;
+  }
+  h1,h2,h3{font-family:Georgia,"Iowan Old Style","Times New Roman",serif; line-height:1.25; color:var(--ink); font-weight:600;}
+  a{color:var(--opt); text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:var(--maxw); margin:0 auto; padding:0 24px}
+  header.site{border-bottom:1px solid var(--line); position:sticky; top:0; background:rgba(13,17,23,.85); backdrop-filter:blur(6px); z-index:10}
+  header.site .wrap{display:flex; align-items:center; justify-content:space-between; height:60px}
+  .brand{font-family:Georgia,serif; font-weight:600; font-size:19px; letter-spacing:.2px}
+  .brand .dot{color:var(--sar)}
+  nav a{color:var(--muted); margin-left:22px; font-size:15px}
+  nav a:hover{color:var(--ink); text-decoration:none}
+  .hero{padding:72px 0 40px; border-bottom:1px solid var(--line)}
+  .hero h1{font-size:44px; margin:0 0 14px}
+  .hero p.lead{font-size:20px; color:var(--muted); max-width:680px; margin:0 0 28px}
+  .btns a{display:inline-block; padding:11px 20px; border-radius:7px; font-size:15px; font-weight:600; margin:0 10px 10px 0}
+  .btn-primary{background:var(--green); color:#fff}
+  .btn-primary:hover{background:var(--green-h); text-decoration:none}
+  .btn-ghost{border:1px solid var(--line); color:var(--ink); background:var(--soft)}
+  .btn-ghost:hover{border-color:var(--muted); text-decoration:none}
+  .tag{display:inline-block; font-size:12.5px; letter-spacing:.5px; text-transform:uppercase; color:var(--muted); border:1px solid var(--line); border-radius:999px; padding:3px 11px; margin-bottom:22px}
+  section{padding:54px 0; border-bottom:1px solid var(--line)}
+  section h2{font-size:28px; margin:0 0 6px}
+  section .sub{color:var(--muted); margin:0 0 26px}
+  figure{margin:26px 0 0}
+  figure img{width:100%; height:auto; border:1px solid var(--line); border-radius:10px; display:block}
+  figcaption{font-size:13.5px; color:var(--muted); margin-top:8px; text-align:center}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:42px; align-items:stretch}
+  .grid2 .card{height:100%}
+  @media(max-width:760px){.grid2{grid-template-columns:1fr; gap:30px} .hero h1{font-size:34px}}
+  .card{border:1px solid var(--line); border-radius:12px; padding:26px; background:var(--soft)}
+  .card h3{margin:0 0 4px; font-size:21px}
+  .card.sar h3{color:var(--sar)} .card.opt h3{color:var(--opt)}
+  .card .pol{font-size:13px; letter-spacing:.4px; text-transform:uppercase; color:var(--muted); margin-bottom:14px}
+  ul.feat{margin:14px 0 0; padding:0; list-style:none}
+  ul.feat li{padding:5px 0 5px 22px; position:relative; font-size:15.5px; color:#c9d1d9}
+  ul.feat li::before{content:"›"; position:absolute; left:4px; color:var(--accent); font-weight:700}
+  pre{background:#161b22; color:#e6edf3; padding:18px 20px; border-radius:9px; overflow:auto; font-size:14px; line-height:1.5; border:1px solid var(--line)}
+  pre .c{color:#8b949e}
+  code.inline{background:var(--soft); border:1px solid var(--line); border-radius:5px; padding:1px 6px; font-size:14px}
+  .note{background:#161b22; border:1px solid var(--line); border-left:3px solid #d29922; border-radius:9px; padding:14px 18px; font-size:15px; color:#c9d1d9}
+  table.req{width:100%; border-collapse:collapse; margin-top:8px; font-size:15px}
+  table.req th,table.req td{text-align:left; padding:9px 10px; border-bottom:1px solid var(--line); vertical-align:top}
+  table.req th{color:var(--muted); font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:.4px}
+  .refs{font-size:14.5px; color:#c9d1d9}
+  .refs li{margin-bottom:8px}
+  footer{padding:40px 0 60px; color:var(--muted); font-size:14.5px}
+  footer a{color:var(--accent)}
+  .muted{color:var(--muted)}
+  /* tutorial */
+  .tut{margin:18px 0 8px}
+  .tut h3{font-size:19px; margin:0 0 10px}
+  .tut.sar h3{color:var(--sar)} .tut.opt h3{color:var(--opt)}
+  ol.steps{margin:0 0 8px; padding-left:0; list-style:none; counter-reset:step}
+  ol.steps li{position:relative; padding:8px 0 8px 42px; border-bottom:1px solid var(--line); font-size:15.5px; color:#c9d1d9}
+  ol.steps li:last-child{border-bottom:0}
+  ol.steps li::before{counter-increment:step; content:counter(step); position:absolute; left:0; top:7px;
+    width:26px; height:26px; border-radius:50%; background:var(--soft); border:1px solid var(--line);
+    color:var(--ink); font-size:13px; font-weight:600; display:flex; align-items:center; justify-content:center}
+  ol.steps li b{color:var(--ink); font-weight:600}
+  .eg{background:var(--soft); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:9px;
+    padding:12px 16px; font-size:14.5px; color:#c9d1d9; margin:14px 0}
+  .ph{border:1px dashed #3a4150; border-radius:10px; background:var(--soft); color:var(--muted);
+    text-align:center; padding:40px 16px; font-size:14px; margin:16px 0}
+  .ph span{display:block; font-size:12.5px; margin-top:6px; color:#6e7681}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <span class="brand">Sentinel&nbsp;Foundry<span class="dot">.</span></span>
+    <nav>
+      <a href="#foundries">Tools</a>
+      <a href="#install">Install</a>
+      <a href="#tutorial">Tutorial</a>
+      <a href="#cite">Cite</a>
+      <a href="https://github.com/EnMaga/sentinel-foundry">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <span class="tag">Open-source · research preview</span>
+    <h1>From raw Sentinel scenes to analysis-ready data — without the command line.</h1>
+    <p class="lead">Sentinel Foundry is a pair of guided desktop tools that download Sentinel-1 and Sentinel-2 imagery and turn it into clean, Cloud-Optimized GeoTIFF indices for analysis — built on ESA SNAP and GDAL.</p>
+    <div class="btns">
+      <a class="btn-primary" href="https://github.com/EnMaga/sentinel-foundry">View on GitHub</a>
+      <a class="btn-ghost" href="#install">Get started</a>
+    </div>
+  </div>
+</div>
+
+<section id="overview">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">Two focused applications, one consistent workflow.</p>
+    <p>Each tool walks you through the full chain in a single window: pick an area of interest (file or drawn on a map) and a date range, download the scenes, run the scientific preprocessing, and write the results as 10&nbsp;m Cloud-Optimized GeoTIFFs ready for GIS or machine learning. Dependencies are checked up front, downloads are verified for integrity, and long jobs report live progress and ETA.</p>
+    <figure>
+      <img src="assets/demo.gif?v=3" alt="Drawing an area of interest on the interactive map in SAR Foundry" loading="lazy">
+      <figcaption>Setting the area of interest — <em>Draw on map</em> opens an interactive Google-satellite basemap (SAR Foundry).</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="foundries">
+  <div class="wrap">
+    <h2>The two foundries</h2>
+    <p class="sub">Sentinel-1 (radar) and Sentinel-2 (optical), each tailored to its sensor.</p>
+    <div class="grid2">
+      <div class="card sar">
+        <h3>SAR Foundry</h3>
+        <div class="pol">Sentinel-1 GRD · SNAP ARD · COG indices</div>
+        <p>Backscatter and polarimetric indices from Sentinel-1, processed through a rigorous ESA SNAP chain.</p>
+        <ul class="feat">
+          <li>Download from ASF (NASA Earthdata) or Copernicus CDSE, with retry, resume and integrity checks</li>
+          <li>SNAP preprocessing: σ⁰ Standard or γ⁰ RTC presets, or your own graph</li>
+          <li>Configurable speckle filter and terrain-correction DEM</li>
+          <li>Outputs: VV, VH, CR, RVI, polarisation difference — plus custom NumPy bands</li>
+        </ul>
+      </div>
+      <div class="card opt">
+        <h3>Optical Foundry</h3>
+        <div class="pol">Sentinel-2 L2A · cloud-masked · biophysical + spectral</div>
+        <p>Surface-reflectance bands, spectral indices and biophysical variables from Sentinel-2.</p>
+        <ul class="feat">
+          <li>Free, anonymous download from AWS EarthSearch (no account needed)</li>
+          <li>Scene-classification (SCL) cloud masking</li>
+          <li>Biophysical variables: LAI, CWC, FAPAR, FCOVER</li>
+          <li>Indices (NDVI, NDWI, NDII, EVI, …) and bands B2–B12 — plus custom indices</li>
+        </ul>
+      </div>
+    </div>
+    <figure>
+      <img src="assets/sar_download.jpg?v=3" alt="SAR Foundry Download tab" loading="lazy">
+      <figcaption>SAR Foundry &mdash; Download tab: source, area of interest, dates and orbit, with dependency checks and a live pipeline log.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/optical.jpg?v=3" alt="Optical Foundry Download tab" loading="lazy">
+      <figcaption>Optical Foundry &mdash; Download tab: AOI, date range, cloud-cover threshold and parallel workers for Sentinel-2 L2A.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Installation &amp; quick start</h2>
+    <p class="sub">Windows, macOS or Linux. Python handles its own environment on first run.</p>
+
+    <table class="req">
+      <tr><th>Requirement</th><th>Notes</th></tr>
+      <tr><td>Python 3.11 or 3.12</td><td>The app creates its own virtual environment and installs packages on first launch.</td></tr>
+      <tr><td>ESA SNAP</td><td><strong>Must include the Microwave Toolbox</strong> (the Sentinel-1 / SAR toolbox; called “Sentinel-1 Toolbox / S1TBX” in SNAP&nbsp;≤&nbsp;11). Needed by SAR Foundry only.</td></tr>
+      <tr><td>GDAL</td><td>For writing Cloud-Optimized GeoTIFFs (e.g. via QGIS or OSGeo4W).</td></tr>
+    </table>
+
+    <p style="margin-top:24px"><strong>Option A — download a ready-made build (no git needed).</strong> Grab the zip for your OS from the <a href="https://github.com/EnMaga/sentinel-foundry/releases">Releases page</a>, extract it anywhere, and double-click <strong>Sentinel&nbsp;Foundry</strong>. Keep everything together in the extracted folder — the launcher looks for the pipeline scripts next to itself. The builds are <strong>unsigned</strong>, so the first launch shows a one-time security warning (see the note below).</p>
+
+    <p style="margin-top:18px"><strong>Option B — clone and run from source.</strong> Open the launcher &mdash; it builds the environment for you on first use:</p>
+<pre><span class="c"># get the code</span>
+git clone https://github.com/EnMaga/sentinel-foundry.git
+cd sentinel-foundry
+
+<span class="c"># open the launcher: pick SAR or Optical from one window</span>
+python sentinel_foundry.py
+
+<span class="c"># optional: put a desktop icon (Windows / macOS / Linux)</span>
+python install_sentinelfoundry.py</pre>
+
+    <p>The launcher creates <strong>one shared virtual environment</strong> in the repo folder and installs <strong>only the chosen tool&rsquo;s</strong> Python packages the first time you open it (a progress bar shows while it works); later launches reuse it. You can still start a tool directly with <code class="inline">python s1_pipeline_ui.py</code> (SAR) or <code class="inline">python s2_pipeline_ui.py</code> (Optical).</p>
+
+    <p class="note"><strong>SNAP tip:</strong> when installing ESA SNAP, keep the <strong>Microwave Toolbox</strong> component ticked (called <em>Sentinel-1 Toolbox / S1TBX</em> in SNAP&nbsp;≤&nbsp;11) and run <em>Help → Check for Updates</em> once. SAR Foundry checks this at startup and <strong>blocks START</strong> with a clear message if the toolbox is missing — so you find out before a run, not after every scene fails. Full requirements and a troubleshooting guide are in the <a href="https://github.com/EnMaga/sentinel-foundry#readme">README</a>.</p>
+
+    <p class="note" style="border-left-color:var(--accent)"><strong>Unsigned build:</strong> the installers carry no paid code-signing certificate, so your OS warns you once on first launch — Windows SmartScreen (<em>More info → Run anyway</em>), macOS Gatekeeper (right-click → <em>Open</em>), or a <code class="inline">chmod +x</code> on Linux. This is about the missing signature, not the app.</p>
+  </div>
+</section>
+
+<section id="tutorial">
+  <div class="wrap">
+    <h2>Tutorial — using the apps</h2>
+    <p class="sub">A guided walkthrough of each window, from area of interest to finished COGs.</p>
+
+    <figure>
+      <img src="assets/launcher.jpg?v=3" alt="Sentinel Foundry launcher" loading="lazy">
+      <figcaption>The launcher &mdash; open SAR Foundry or Optical Foundry from one window; it sets up the environment on first use.</figcaption>
+    </figure>
+
+    <div class="tut sar">
+      <h3>SAR Foundry — step by step</h3>
+      <ol class="steps">
+        <li><b>Pick a source</b> in the Download tab: ASF (NASA Earthdata bearer token), Copernicus CDSE (refresh/offline token — no password stored), or an existing <code class="inline">.SAFE</code> folder. CDSE downloads run <b>up to 5 in parallel and resume</b> a dropped transfer via HTTP Range; ASF is sequential (parallel connections truncate its VV band). Live Mbps is shown per scene.</li>
+        <li><b>Set the area of interest:</b> browse to a <code class="inline">.shp</code>/<code class="inline">.gpkg</code>/<code class="inline">.geojson</code>, or click <em>Draw on map</em>. Any CRS is auto-reprojected.</li>
+        <li><b>Choose dates and orbit</b> (ASC, DSC or Both).</li>
+        <li><b>Processing tab:</b> pick the preprocessing graph (σ⁰ standard, γ⁰ RTC, or a custom XML), the speckle filter, and the DEM.</li>
+        <li><b>Parallel SNAP jobs:</b> start with <b>1</b> the first time (lets the DEM cache populate cleanly); raise it later if RAM allows.</li>
+        <li><b>Output tab:</b> choose bands (VV, VH, CR, RVI, DIFF), linear/dB scale, the three output folders, and the CRS.</li>
+        <li><b>Check the Dependencies panel is green</b> (SNAP GPT incl. Microwave Toolbox, GDAL, Python packages), then press <b>START</b>. On a re-run the <b>progress bar and ETA are skip-aware</b> — already-finished scenes are pre-counted, so the bar reflects real remaining work.</li>
+        <li><b>Verify:</b> downloads are integrity-checked before, during and after unzip (truncated or corrupt archives are dropped so SNAP never sees them). Afterwards run <code class="inline">check_safe.py</code> on the SAFE folder to re-confirm; its <code class="inline">--delete</code> mode is guarded — on a broken GDAL environment it refuses the deep read rather than mass-deleting valid scenes.</li>
+      </ol>
+      <p class="eg"><b>Example.</b> Sentinel-1 sigma-nought over an agricultural AOI, August-December, descending orbit, Lee Sigma speckle filter, Copernicus 30 m DEM &rarr; 5 COG bands per scene in a <code class="inline">DSC/</code> folder.</p>
+
+      <p class="muted" style="font-size:14px; margin:22px 0 4px; letter-spacing:.3px; text-transform:uppercase">The tabs, one by one</p>
+      <figure>
+        <img src="assets/sar_map.jpg" alt="SAR Foundry Draw on map window" loading="lazy">
+        <figcaption><b>Download &rarr; Draw on map.</b> Sketch a polygon or rectangle on a Leaflet map (Google Hybrid / Satellite / OpenStreetMap basemaps) and click <em>Use this AOI</em> &mdash; no file needed.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/sar_processing.jpg?v=3" alt="SAR Foundry Processing tab" loading="lazy">
+        <figcaption><b>Processing.</b> Preprocessing graph (σ⁰ Standard, γ⁰ RTC or custom XML), speckle filter, DEM, multi-tile seam handling and parallel unzip.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/sar_speckle.jpg" alt="SAR Foundry custom speckle filter dialog" loading="lazy">
+        <figcaption><b>Processing &rarr; custom speckle filter.</b> The <em>Configure</em> button opens all nine SNAP speckle filters (here Refined Lee, 7&times;7); the choice is written into every output filename.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/sar_outputs.jpg?v=3" alt="SAR Foundry Output tab" loading="lazy">
+        <figcaption><b>Output.</b> Choose bands (VV, VH, CR, RVI, DIFF) and scale, set parallel SNAP jobs and JVM heap, index workers, the three output folders and the CRS.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/sar_calc.jpg" alt="SAR Foundry Raster Calc tab" loading="lazy">
+        <figcaption><b>Raster Calc.</b> Post-processing calculator &mdash; apply a NumPy expression such as <code class="inline">(VV - VH)/(VV + VH)</code> to existing COG bands.</figcaption>
+      </figure>
+    </div>
+
+    <div class="tut opt" style="margin-top:34px">
+      <h3>Optical Foundry &mdash; step by step</h3>
+      <ol class="steps">
+        <li><b>Set the area of interest</b> (same formats as SAR). No account needed &mdash; data comes from public AWS EarthSearch.</li>
+        <li><b>Choose the date range.</b></li>
+        <li><b>Max cloud cover:</b> 0 = SCL mask only; &gt;0 = also skip whole scenes above that cloud %.</li>
+        <li><b>Parallel workers:</b> how many days to process at once (1&ndash;8, I/O-bound). Failed days can be auto-retried, and a live ETA is shown from average seconds per day.</li>
+        <li><b>Pick outputs:</b> biophysical variables (LAI, CCC, CWC, FAPAR, FCOVER), spectral bands (B2-B12), and indices (NDVI, NDWI, ...) &mdash; plus any custom index.</li>
+        <li><b>Set the output folder and CRS</b>, choose <b>Skip</b> (resume) or <b>Overwrite</b> for existing files, then press <b>START</b>. AOIs spanning two MGRS tiles are processed per-tile and mosaicked into one file per date.</li>
+      </ol>
+      <p class="eg"><b>Example.</b> Sentinel-2 NDVI + LAI over the same AOI, one growing season, cloud cover &le; 40% &rarr; cloud-masked 10 m COGs, one file per index per date.</p>
+
+      <p class="muted" style="font-size:14px; margin:22px 0 4px; letter-spacing:.3px; text-transform:uppercase">The tabs, one by one</p>
+      <figure>
+        <img src="assets/optical_processing.jpg?v=3" alt="Optical Foundry Processing tab" loading="lazy">
+        <figcaption><b>Processing.</b> Toggle biophysical variables (LAI, CCC, CWC, FAPAR, FCOVER), spectral bands (B2&ndash;B12) and indices (NDVI, NDWI, NDII, EVI, MSAVI2, &hellip;), plus up to three custom NumPy indices.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/optical_output.jpg" alt="Optical Foundry Output tab" loading="lazy">
+        <figcaption><b>Output.</b> Output CRS (AUTO native UTM or any EPSG) and the existing-file policy &mdash; <em>Skip</em> to resume a run, <em>Overwrite</em> to rebuild every file.</figcaption>
+      </figure>
+      <figure>
+        <img src="assets/optical_rcalc.jpg" alt="Optical Foundry Raster Calc tab" loading="lazy">
+        <figcaption><b>Raster Calc.</b> The same calculator as SAR &mdash; compute custom NumPy expressions over any existing Sentinel-2 COG output.</figcaption>
+      </figure>
+    </div>
+
+    <p class="muted" style="font-size:13.5px; margin-top:18px">Tip: both tools can also be opened from the unified launcher (<code class="inline">sentinel_foundry.py</code>), and the Raster Calc tab lets you compute custom NumPy expressions on any existing COG output.</p>
+  </div>
+</section>
+
+<section id="outputs">
+  <div class="wrap">
+    <h2>Analysis-ready outputs</h2>
+    <p class="sub">Self-describing filenames, per-orbit folders, float32 Cloud-Optimized GeoTIFFs.</p>
+    <p>Every output records how it was made &mdash; area of interest, speckle filter, DEM and preprocessing graph &mdash; directly in the filename, so results stay traceable across experiments. Both foundries follow the same convention.</p>
+    <figure>
+      <img src="assets/s1_asc.jpg" alt="SAR Foundry output GeoTIFFs in Windows Explorer" loading="lazy">
+      <figcaption>SAR Foundry output &mdash; five single-band COGs per date (CR, DIFF, RVI, VH, VV) in the <code class="inline">ASC/</code> folder. The name encodes AOI, speckle filter (<code class="inline">refined_lee</code>), orbit and band; DIFF (VH&minus;VV, linear) is near-black by nature.</figcaption>
+    </figure>
+    <figure>
+      <img src="assets/lai.jpg" alt="Optical Foundry LAI output GeoTIFFs in Windows Explorer" loading="lazy">
+      <figcaption>Optical Foundry output &mdash; cloud-masked LAI, one COG per acquisition date (black = SCL-masked cloud / nodata), named by date, AOI and satellite letter (A/B).</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section id="cite">
+  <div class="wrap">
+    <h2>Citing &amp; references</h2>
+    <p class="sub">If Sentinel Foundry supports your research, please cite the repository and the underlying tools.</p>
+    <p><strong>Software:</strong> Magazzino, E. (2026). <em>Sentinel Foundry</em> (v1.0.7) [Computer software]. <a href="https://github.com/EnMaga/sentinel-foundry">github.com/EnMaga/sentinel-foundry</a>. APA/BibTeX are also available via <em>“Cite this repository”</em> on GitHub (from <code class="inline">CITATION.cff</code>).</p>
+    <p style="margin-top:18px"><strong>Underlying methods and tools</strong></p>
+    <ul class="refs">
+      <li>Z&uuml;hlke, M. et al. (2015). <em>SNAP (Sentinel Application Platform) and the ESA Sentinel 3 Toolbox.</em> ESA Living Planet Symposium.</li>
+      <li>Filipponi, F. (2019). <em>Sentinel-1 GRD preprocessing workflow.</em> Proceedings 18(1), 11.</li>
+      <li>Small, D. (2011). <em>Flattening gamma: radiometric terrain correction for SAR imagery.</em> IEEE TGRS 49(8), 3081-3093.</li>
+      <li>Trudel, M., Charbonneau, F., Leconte, R. (2012). <em>Using RADARSAT-2 polarimetric and ENVISAT-ASAR dual-polarization data for estimating soil moisture over agricultural fields.</em> Canadian Journal of Remote Sensing 38(4), 514-527.</li>
+      <li>Gillies, S. et al. (2013-). <em>Rasterio: geospatial raster I/O for Python.</em></li>
+      <li>Alaska Satellite Facility (ASF), NASA Earthdata; Copernicus Data Space Ecosystem (CDSE); AWS Open Data - Sentinel-2 L2A COGs.</li>
+    </ul>
+    <p class="muted" style="font-size:13.5px; margin-top:16px">Sentinel-1 and Sentinel-2 data &copy; ESA / Copernicus. SNAP is developed by ESA. This project is independent and not affiliated with ESA, NASA or Amazon.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>Sentinel Foundry &mdash; developed by Enrico Magazzino. MIT-licensed; see the
+      <a href="https://github.com/EnMaga/sentinel-foundry">project repository</a>.</p>
+    <p class="muted">Developed during a PhD at the TESAF Department, University of Padova, funded by the European Union &mdash; NextGenerationEU under the Italian National Recovery and Resilience Plan (PNRR), Mission 4, Ministerial Decree no. 630/2024.</p>
+    <p class="muted">Built on free and open data and tools. Feedback and issues welcome on GitHub.</p>
+  </div>
+</footer>
+
+</body>
+</html>
