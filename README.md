@@ -10,7 +10,7 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 > 📖 **Using Sentinel Foundry in your research?** Please cite it: click
 > **"Cite this repository"** in the sidebar (APA/BibTeX from
 > [CITATION.cff](CITATION.cff)), or cite *Magazzino, E. (2026). Sentinel
-> Foundry (v1.0.7) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+> Foundry (v1.0.8) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
 
 ---
 
@@ -218,6 +218,8 @@ Anything flagged `CORRUPT` is deleted and written to `pipeline_errors/`, so SNAP
 
 A real-time throughput monitor samples directory growth every second and displays current speed in **Mbps** in the progress bar. Average speed per scene is also logged on completion.
 
+**Broken `.SAFE` auto-recovery (including *Use existing `.SAFE` folder* mode):** at the start of step 1 the pipeline deletes any `.SAFE` directory that has no `manifest.safe` — an empty or half-extracted product left behind by an interrupted download/extraction. Leaving one in place would both crash SNAP (`SNAP FAILED (rc=1) … manifest.safe does not exist`) and block recovery, because the download and unzip steps skip when a `.SAFE` of that name already exists. Even when download is otherwise off (existing-folder mode), the missing scenes are then **re-downloaded automatically** for just those acquisition dates, provided credentials (ASF token or CDSE login) and an AOI are set. The re-download is shown in the log (`⤓ RE-DOWNLOADING N broken .SAFE date(s): …`) and animates the **Download** progress bar. If no credentials/AOI are available it logs a warning and continues without those scenes.
+
 #### Standalone integrity checker — `check_safe.py`
 
 The same checks can be run manually on any folder of downloads (e.g. to vet an existing archive before processing):
@@ -274,6 +276,8 @@ When your AOI spans two or more adjacent Sentinel-1 frames, tiles are processed 
 ### Stop button
 
 Pressing **■ STOP** immediately kills the running SNAP GPT subprocess (`Popen.kill()`), cancels pending downloads, and halts the pipeline. The UI resets to ready state.
+
+**Closing the window while processing:** if you click the window's ✕ (close) button while a run is still in progress, both SAR Foundry and Optical Foundry now ask *"The pipeline is still running — are you sure you want to quit?"* (default **No**). Confirming stops the run first (killing SNAP subprocesses on SAR / cancelling pending days on Optical) and then closes; declining leaves the window open. Closing while idle exits with no prompt.
 
 ---
 

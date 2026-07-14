@@ -494,13 +494,22 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         os.makedirs(out_dir,   exist_ok=True)
 
         # ── step 1: download ─────────────────────────────────────────────
+        # Broken/empty .SAFE products (interrupted download or extraction) are
+        # removed first — they fail SNAP and block re-download/unzip otherwise.
+        _broken_safes = _prune_broken_safes(safe_dir, log)
         failed_downloads = []
         if cfg["do_download"]:
             failed_downloads = _download_dispatch(cfg, safe_dir, log, progress_cb)
         else:
             log("\n── STEP 1: Skipped (use existing .SAFE files) ──")
-            # Still unzip any .zip files present — they won't be found by SNAP otherwise
             _stop_ev = cfg.get("stop_event")
+            # Re-fetch any broken products so a single corrupt download doesn't
+            # silently drop a scene, even though download is otherwise off.
+            if _broken_safes:
+                log(f"  {len(_broken_safes)} broken/incomplete .SAFE found — "
+                    f"attempting re-download…")
+                _redownload_missing(cfg, safe_dir, _broken_safes, log, progress_cb)
+            # Still unzip any .zip files present — they won't be found by SNAP otherwise
             _zips = glob.glob(os.path.join(safe_dir, "*.zip"))
             if _zips:
                 log(f"  Found {len(_zips)} .zip archive(s) in folder — extracting before SNAP…")
@@ -1505,7 +1514,58 @@ def _extract_archive(zp, dest, log):
     except Exception as e:
         log(f"    (fast extractor error: {e} — falling back to zipfile)")
     with zipfile.ZipFile(zp, 'r') as z:
-        z.extractall(dest)
+        z.extractall(_long_path(dest))
+
+
+def _long_path(p):
+    # ponytail: Windows MAX_PATH(260) escape. Deep Sentinel names (temp .__ext_ +
+    # nested .SAFE\...SAFE-report.pdf) blow past 260 and zipfile's open() then
+    # raises FileNotFoundError. The \\?\ prefix lifts the limit; noop off Windows.
+    if os.name != "nt":
+        return p
+    ap = os.path.abspath(p)
+    return ap if ap.startswith("\\\\?\\") else "\\\\?\\" + ap
+
+
+def _is_drive_gone(e):
+    # A surprise-removed / disconnected drive (external USB, USB selective-suspend,
+    # loose cable) raises WinError 433 "device does not exist" on first touch, then
+    # EINVAL(22) on every later open() of a path on that dead drive. Treat both as
+    # "the output drive vanished" so callers can abort once instead of failing N times.
+    if os.name != "nt" or not isinstance(e, OSError):
+        return False
+    return getattr(e, "winerror", None) == 433 or e.errno == 22
+
+
+def _wait_for_drive(path, log, stop_ev=None, poll=120):
+    """Block until `path` is writable again (its drive reconnected), or the user
+    asks to stop. Returns True once available, False if stopped while waiting.
+    Lets an unattended run survive an external drive that drops out and returns."""
+    def _ok():
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".drive_check")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+    if _ok():
+        return True
+    drive = os.path.splitdrive(os.path.abspath(path))[0] or path
+    log(f"  ⏸ Output drive {drive} disconnected — waiting for it to reconnect "
+        f"(re-checking every {poll // 60} min; press Stop to abort)…")
+    waited = 0
+    while not (stop_ev and stop_ev.is_set()):
+        time.sleep(poll)
+        waited += poll
+        if _ok():
+            log(f"  ▶ Drive {drive} back after {waited // 60} min — resuming.")
+            return True
+        log(f"  … still waiting for {drive} ({waited // 60} min)")
+    log(f"  [Stopped while waiting for {drive}]")
+    return False
 
 
 def _locate_safe_root(root):
@@ -1552,6 +1612,67 @@ def _normalize_safe_dirs(safe_dir, log=lambda *a: None):
                 log(f"  Renamed {e} → {e}.SAFE (added missing suffix)")
             except OSError:
                 pass
+
+
+def _prune_broken_safes(safe_dir, log=lambda *a: None):
+    """Delete .SAFE dirs with no manifest.safe (empty/incomplete products from an
+    interrupted download or extraction) and return the removed folder names.
+    Leaving one in place both fails SNAP with an opaque rc=1 AND blocks recovery —
+    the download loop and _unzip_zips both skip when a .SAFE of that name exists."""
+    removed = []
+    try:
+        entries = os.listdir(safe_dir)
+    except OSError:
+        return removed
+    for e in entries:
+        p = os.path.join(safe_dir, e)
+        if (os.path.isdir(p) and e.upper().endswith(".SAFE")
+                and not os.path.isfile(os.path.join(p, "manifest.safe"))):
+            try:
+                shutil.rmtree(p)
+                removed.append(e)
+                log(f"  Removed broken .SAFE (no manifest): {e}")
+            except Exception as _re:
+                log(f"  ⚠ could not remove broken .SAFE {e}: {_re}")
+    return removed
+
+
+def _redownload_missing(cfg, safe_dir, removed_names, log, progress_cb):
+    """Re-fetch products that were found broken and removed — used in existing-
+    .SAFE-folder mode so one corrupt download doesn't silently drop a scene.
+    Reuses the normal download path (retry_dates filter); needs credentials and
+    an AOI. Warns and returns if it can't."""
+    dates = sorted({f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:]}"
+                    for n in removed_names
+                    if (m := re.search(r'_(\d{8})T\d{6}_', n))})
+    if not dates:
+        return
+    has_asf, has_cdse = _has_asf_creds(cfg), _has_cdse_creds(cfg)
+    if not (has_asf or has_cdse):
+        log("  ⚠ Cannot re-download the broken .SAFE(s): no download credentials "
+            "entered (ASF token in section 6, or CDSE login in section 6b). "
+            "Those scene(s) will be missing from the output.")
+        return
+    if not (cfg.get("aoi_path") and os.path.isfile(cfg.get("aoi_path", ""))):
+        log("  ⚠ Cannot re-download the broken .SAFE(s): no AOI file set.")
+        return
+    log(f"  ⤓ RE-DOWNLOADING {len(dates)} broken .SAFE date(s): "
+        f"{', '.join(dates)}")
+    # Kick the Download bar so it's obvious a re-download is underway before the
+    # normal per-scene download progress takes over.
+    progress_cb("download", 0, len(dates),
+                f"re-downloading {len(dates)} broken scene(s)…")
+    tmp = dict(cfg)
+    tmp["retry_dates"] = set(dates)
+    tmp["dl_source"]   = "asf" if has_asf else "cdse"
+    tmp["start_date"]  = min(cfg.get("start_date") or dates[0], dates[0])
+    tmp["end_date"]    = max(cfg.get("end_date") or dates[-1], dates[-1])
+    try:
+        _download_dispatch(tmp, safe_dir, log, progress_cb)
+        _unzip_zips(safe_dir, log, progress_cb, cfg.get("stop_event"), cfg)
+        _normalize_safe_dirs(safe_dir, log)
+    except Exception as _de:
+        log(f"  ⚠ Re-download failed: {_de} — scene(s) will be missing.")
 
 
 def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
@@ -1967,8 +2088,13 @@ def _run_snap_single(safe_path, output_path, gpt, graph, aoi, jvm,
             finally:
                 _set_proc(None)
 
-        if _stop_ev and _stop_ev.is_set():
-            log("    [Stopped by user — subprocess killed]")
+        # Graceful stop: if the user asked to stop but this SNAP run finished
+        # cleanly on its own, publish it (below) so the scene counts as done and
+        # gets its .done sentinel — don't throw away completed work. Only bail
+        # when the process was force-killed / produced nothing.
+        if (_stop_ev and _stop_ev.is_set()
+                and (proc.returncode != 0 or not os.path.isfile(snap_out))):
+            log("    [Stopped by user — scene not finished]")
             return False
 
         if proc.returncode != 0 or not os.path.isfile(snap_out):
@@ -2311,7 +2437,15 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
         glob.glob(os.path.join(safe_dir, "*.SAFE")) +
         glob.glob(os.path.join(safe_dir, "**", "*.SAFE"), recursive=True)
     ))
+    # A .SAFE dir without a manifest.safe is a broken/empty product (interrupted
+    # download or extraction). Feeding it to SNAP fails the whole scene with an
+    # opaque rc=1; skip it here and tell the user to re-download that date.
     safes = [s for s in safes if os.path.isdir(s)]
+    _broken = [s for s in safes if not os.path.isfile(os.path.join(s, "manifest.safe"))]
+    for s in _broken:
+        log(f"  ⚠ SKIP {os.path.basename(s)} — no manifest.safe "
+            f"(empty/incomplete .SAFE; re-download this date)")
+    safes = [s for s in safes if s not in _broken]
 
     # orbit filter
     orbit_filter = cfg["orbit_dir"]
@@ -2360,12 +2494,22 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
         try: return os.path.isfile(p) and os.path.getsize(p) > 1024
         except Exception: return False
 
+    def _grp_sentinel(date, orbit, sat0):
+        # Written once SNAP+cut finishes for a cluster group. Authoritative
+        # "STEP 2 done" marker: clusters outside the scene footprint never get
+        # a .tif, so an all-clusters-present check re-runs the group forever.
+        return os.path.join(snap_dir,
+            f"S1_{date}_SNAP_{aoi_label}_{speckle_tag}_{dem_tag}"
+            f"_{graph_tag}_{sat0}_{orbit}.done")
+
     def _grp_done_cheap(date, orbit, sat0):
         def _cog(tag):
             return (cfg.get("out_dir") and not _pending_index_error(cfg, date, orbit)
                     and glob.glob(os.path.join(cfg.get("out_dir", ""), orbit,
                         f"S1_{date}_SNAP_{aoi_label}_{tag}_*_{orbit}_*.tif")))
         if len(sub_aois) > 1:
+            if os.path.isfile(_grp_sentinel(date, orbit, sat0)):
+                return True
             for s in sub_aois:
                 tag = s.get("tag", "")
                 fp = os.path.join(snap_dir,
@@ -2397,7 +2541,7 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
     log(f"  Parallel SNAP workers: {max_snap_workers}  "
         f"(~{max_snap_workers * jvm // 1024:.0f} GB JVM total)")
 
-    def _do_group(key_slist):
+    def _do_group_once(key_slist):
         (date, orbit), slist = key_slist
         if _stop_ev and _stop_ev.is_set():
             return
@@ -2438,6 +2582,11 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
 
         # ── skip logic + choose the single SNAP subset region ──────────────
         if multi:
+            _sentinel = _grp_sentinel(date, orbit, sat0)
+            if os.path.isfile(_sentinel):
+                log(f"  [{_g}/{total_groups}] SKIP {date} [{orbit}]  (group done)")
+                _mark_skip(f"{date} [{orbit}]  skip")
+                return
             if all(_cluster_done(s.get("tag", "")) for s in sub_aois):
                 log(f"  [{_g}/{total_groups}] SKIP {date} [{orbit}]  "
                     f"(all {len(sub_aois)} clusters done)")
@@ -2524,6 +2673,15 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
                     _clpath, log, skip_done=_cluster_done)
                 log(f"    {len(written)} cluster raster(s) cut from one SNAP run"
                     + (" (masked to fields)" if cfg.get("fields_path") else ""))
+                # Mark the group finished so a later restart skips it — clusters
+                # outside this scene's footprint never produce a .tif, so an
+                # all-clusters-present check would re-run this date forever.
+                try:
+                    with open(_grp_sentinel(date, orbit, sat0), "w",
+                              encoding="utf-8") as _sf:
+                        _sf.write("\n".join(os.path.basename(w) for w in written))
+                except Exception:
+                    pass
             except Exception as _ce:
                 log(f"    [cut] failed: {_ce}")
             finally:
@@ -2539,6 +2697,22 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
                 except Exception as _mk:
                     log(f"    [mask] skipped: {_mk}")
             _mark_done(f"{date} [{orbit}]  ✓")
+
+    def _do_group(key_slist):
+        # Survive an output-drive disconnect mid-run: on a drive-gone OSError,
+        # wait for the drive to come back, then retry the same group. Groups are
+        # idempotent (skip-existing checks + atomic publish), so a retry is safe.
+        # ponytail: re-checks per worker; a retry may re-print the [g/total] index
+        # — cosmetic, only happens on an actual disconnect.
+        while True:
+            try:
+                return _do_group_once(key_slist)
+            except OSError as e:
+                if not _is_drive_gone(e):
+                    raise
+                log(f"  [drive lost during {key_slist[0]}] {e}")
+                if not _wait_for_drive(snap_dir, log, _stop_ev):
+                    return
 
     _tasks = sorted(_scene_groups.items())
     with ThreadPoolExecutor(max_workers=max_snap_workers) as pool:
@@ -3128,6 +3302,7 @@ class App(tk.Tk):
         self._saved_cfg = _load_config()  # load once here, used throughout _build_form
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._start_gdal_log_tail()
         self.update_idletasks()
         # centre on screen
@@ -5282,6 +5457,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 cfg["clean_safe"] = False
                 self._log("Keeping raw .SAFE files (deletion declined).")
         self._running = True
+        self._stopping = False
         self._stop_event.clear()
         with self._proc_lock:
             self._cur_procs.clear()
@@ -5335,9 +5511,34 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             return
         self._on_start(retry_dates=dates)
 
-    def _on_stop(self):
-        self._log("\n[Stopping immediately — killing running subprocess(es)…]")
+    def _on_window_close(self):
+        if getattr(self, "_running", False):
+            if not messagebox.askyesno(
+                    "Processing in progress",
+                    "The pipeline is still running.\n\n"
+                    "Closing now will stop it and kill any running SNAP "
+                    "subprocess(es). Are you sure you want to quit?",
+                    icon="warning", default="no"):
+                return
+            try: self._on_stop(graceful=False)
+            except Exception: pass
+        self.destroy()
+
+    def _on_stop(self, graceful=True):
+        # Graceful (default): stop launching new scenes, but let the SNAP run(s)
+        # already in flight finish and publish — avoids killing minutes of work
+        # and leaving a half-done group. The worker thread drains and calls
+        # _on_done, which re-enables Run. A 2nd Stop press force-kills.
+        if graceful and not getattr(self, "_stopping", False):
+            self._stopping = True
+            self._stop_event.set()
+            self._log("\n[Stopping — finishing the scene(s) already running; no new "
+                      "scenes will start. Press Stop again to force-kill.]")
+            return
+        # Force stop: 2nd Stop press, or window close.
+        self._log("\n[Force-stopping — killing running subprocess(es)…]")
         self._running = False
+        self._stopping = False
         self._stop_event.set()
         # Kill ALL running SNAP/GPT subprocesses (covers parallel workers)
         with self._proc_lock:
@@ -5355,6 +5556,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
     def _on_done(self, success):
         def _update():
             self._running = False
+            self._stopping = False
             self.btn_run.configure(state=tk.NORMAL, bg=ACCENT)
             self.btn_stop.configure(state=tk.DISABLED, bg="#455A64")
             self.progress.stop()

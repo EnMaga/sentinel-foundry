@@ -50,6 +50,8 @@ make_setup_report.js
 snap_batch_python.py
 
 # research / diagnostic scripts (not part of the tool)
+check_geoloc.py
+release.sh
 s2_check_scenes.py
 check_pc_coverage.py
 compare_snap_vs_msc_lee.py

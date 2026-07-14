@@ -212,6 +212,47 @@ def _write_error(cfg, date_str, phase, message):
         f.write("To retry: re-run the pipeline covering this date.\n")
 
 
+def _is_drive_gone(e):
+    # A surprise-removed / disconnected drive (external USB, USB selective-suspend,
+    # loose cable) raises WinError 433 "device does not exist" on first touch, then
+    # EINVAL(22) on every later open() of a path on that dead drive. Treat both as
+    # "the output drive vanished" so callers can wait-and-retry instead of failing.
+    if os.name != "nt" or not isinstance(e, OSError):
+        return False
+    return getattr(e, "winerror", None) == 433 or e.errno == 22
+
+
+def _wait_for_drive(path, log, stop_ev=None, poll=120):
+    """Block until `path` is writable again (its drive reconnected), or the user
+    asks to stop. Returns True once available, False if stopped while waiting.
+    Lets an unattended run survive an external drive that drops out and returns."""
+    def _ok():
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".drive_check")
+            with open(probe, "w") as f:
+                f.write("ok")
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+    if _ok():
+        return True
+    drive = os.path.splitdrive(os.path.abspath(path))[0] or path
+    log(f"  ⏸ Output drive {drive} disconnected — waiting for it to reconnect "
+        f"(re-checking every {poll // 60} min; press Stop to abort)…")
+    waited = 0
+    while not (stop_ev and stop_ev.is_set()):
+        time.sleep(poll)
+        waited += poll
+        if _ok():
+            log(f"  ▶ Drive {drive} back after {waited // 60} min — resuming.")
+            return True
+        log(f"  … still waiting for {drive} ({waited // 60} min)")
+    log(f"  [Stopped while waiting for {drive}]")
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE LOGIC
 # ═══════════════════════════════════════════════════════════════════════════
@@ -447,6 +488,13 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
                 else:
                     log(f"  {sd}: no data")
             except Exception as e:
+                # Output drive dropped out mid-run? Wait for it to reconnect and
+                # retry this day rather than failing it. Re-running skips already-
+                # written outputs (overwrite=False), so a retry is safe. The retry
+                # call carries is_retry=True so `finally` counts the day only once.
+                if _is_drive_gone(e) and _wait_for_drive(out_dir, log, stop_event):
+                    log(f"  {sd}: retrying after drive reconnect…")
+                    return _run_day(sd, is_retry=True)
                 import traceback as _tb
                 msg = _tb.format_exc()
                 log(f"  {sd}: ERROR — {e}")
@@ -1411,6 +1459,7 @@ class App(tk.Tk):
             pass
 
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         # match SAR Foundry's opening size
         w, h = 1200, 860
         x = (self.winfo_screenwidth() - w) // 2
@@ -2543,6 +2592,19 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 f"Re-run {len(dates)} failed day(s)?\n\n" + "\n".join(dates)):
             return
         self._on_start(retry_days=dates)
+
+    def _on_window_close(self):
+        if getattr(self, "_running", False):
+            if not messagebox.askyesno(
+                    "Processing in progress",
+                    "The pipeline is still running.\n\n"
+                    "Closing now will stop it (active HTTP requests finish, then "
+                    "it exits). Are you sure you want to quit?",
+                    icon="warning", default="no"):
+                return
+            try: self._on_stop()
+            except Exception: pass
+        self.destroy()
 
     def _on_stop(self):
         self._log("\n[Stopping — cancelling pending days (active HTTP requests will complete then exit)…]")
