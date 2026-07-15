@@ -4,13 +4,13 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 
 | Tool | Script | Satellite | Source |
 |------|--------|-----------|--------|
-| **SAR Foundry** | `s1_pipeline_ui.py` | Sentinel-1 GRD | ASF (NASA Earthdata) |
+| **SAR Foundry** | `s1_pipeline_ui.py` | Sentinel-1 GRD | CDSE S3 (fastest), ASF (NASA Earthdata), or CDSE OData |
 | **Optical Foundry** | `s2_pipeline_ui.py` | Sentinel-2 L2A | AWS EarthSearch (public) |
 
 > 📖 **Using Sentinel Foundry in your research?** Please cite it: click
 > **"Cite this repository"** in the sidebar (APA/BibTeX from
 > [CITATION.cff](CITATION.cff)), or cite *Magazzino, E. (2026). Sentinel
-> Foundry (v1.0.8) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+> Foundry (v1.0.9) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
 
 ---
 
@@ -100,12 +100,14 @@ Optional dB copies (suffix `_dB`) can be enabled in section 9 of the GUI — for
 
 | Tab | Section | Description |
 |-----|---------|-------------|
-| ⬇ Download | 1 | Sentinel-1 Source — download from ASF, Copernicus CDSE, or use existing `.SAFE` folder |
+| ⬇ Download | 1 | Sentinel-1 Source — download from CDSE S3 (fastest), ASF, Copernicus CDSE, or use existing `.SAFE` folder |
 | ⬇ Download | 3 | Area of Interest — `.shp`, `.gpkg`, `.geojson`, or draw on interactive map |
 | ⬇ Download | 4 | Date Range — with optional calendar picker |
 | ⬇ Download | 5 | Orbit Direction — ASC, DSC, or Both |
+| ⬇ Download | 5b | Satellites — pick S1A / S1B / S1C (e.g. S1C-only to backfill; ASF has no S1C) |
 | ⬇ Download | 6 | ASF Credentials — NASA Earthdata token or username/password |
 | ⬇ Download | 6b | Copernicus CDSE Credentials — refresh/offline token only for CDSE download |
+| ⬇ Download | **6c** | **CDSE S3 Keys — fastest download, direct from object store (no unzip)** |
 | ⬇ Download | **7** | **Parallel Downloads — 1–5 scenes simultaneously with real-time Mbps display** |
 | ⚙ Processing | 2 | Preprocessing Graph — σ⁰ Standard, γ⁰ RTC, or custom XML |
 | ⚙ Processing | 2b | Speckle Filter — Lee Sigma, Gamma Map, or fully configurable custom |
@@ -188,16 +190,39 @@ The simplest reliable starting point is to copy one of the built-in graphs in `s
 
 ---
 
-### Downloads (section 7)
+### Downloads (sections 1, 6c, 7)
 
-Download behaviour differs between the two sources:
+There are three download sources. **CDSE S3 is the fastest** and needs no unzip step.
 
-| Source | Parallel support | Why |
-|--------|-----------------|-----|
-| **ASF** | ❌ Sequential only (forced to 1 worker) | ASF's server truncates the VV band when multiple connections share the same user token simultaneously — a known server-side bug, not a bandwidth issue |
-| **Copernicus CDSE** | ✅ Up to 5 parallel workers | CDSE serves files from S3-compatible object storage (Ceph/OpenStack Swift). Bearer tokens are stateless JWTs — multiple threads share the same token without interference, each gets an independent byte stream |
+| Source | Parallel support | Notes |
+|--------|-----------------|-------|
+| **CDSE S3** *(section 6c)* | ✅ configurable 1–16 files per scene (default 8) | Reads the `.SAFE` directly from CDSE's `eodata` object store — **bypasses the OData throttle** and delivers the extracted folder, so **no unzip**. Capped by CDSE at **~20 MB/s (160 Mbit/s)** and **12 TB/month** per S3 key, so ~8 parallel files usually saturates it; lower it if the link feels congested. |
+| **ASF** | ❌ Sequential only (forced to 1 worker) | ASF's server truncates the VV band when multiple connections share the same user token simultaneously — a known server-side bug, not a bandwidth issue. |
+| **Copernicus CDSE** (OData) | ✅ Up to 5 parallel workers | Serves via the OData `/$value` endpoint. Bearer JWTs are shared across threads, but the endpoint applies a **per-account fair-use throttle** that drops sustained transfers to single-digit Mbit/s once a rolling quota is hit. |
 
-The **parallel downloads** spinner (section 7) is wired to both sources, but ASF ignores values > 1. For CDSE, 2–3 workers is a good balance between speed and fair-use policy.
+**Benchmark** (single machine, 1 Gbps line, one full IW GRDH scene, measured 2026):
+
+| Method | Throughput | ~1 GB scene |
+|--------|-----------|-------------|
+| **CDSE S3** (16 parallel files) | **112 Mbit/s** (near the 160 Mbit/s cap) | ~70 s |
+| ASF (1 connection) | 48–67 Mbit/s | ~2–3 min |
+| CDSE OData, 3 parallel workers | 21 Mbit/s (throttled) | ~6 min |
+| CDSE OData, 1 connection (throttled) | 7 Mbit/s | ~19 min |
+
+To go faster still, generate multiple S3 keys (each has its own 20 MB/s cap). Get keys at the [CDSE S3 keys manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/).
+
+The **parallel downloads** spinner (section 7) applies to **CDSE OData and CDSE S3** (2–5 scenes at once; ASF ignores values > 1). For CDSE S3 it stacks with the **"Parallel files / scene"** control (section 6c, 1–16, default 8): a single S3 scene rarely saturates the 20 MB/s per-key cap, so running 3–5 scenes at once fills it.
+
+### Satellite selection & Sentinel-1C (section 5b)
+
+Pick which satellites to fetch (S1A / S1B / S1C). Notes:
+
+- **All sources return Sentinel-1C.** S1C became available in April 2025; ASF exposes it via `asf_search` **≥ 8.1.3** (this app now requires that — older 6.x could not see S1C), and CDSE / CDSE S3 have it too. In a like-for-like 4-month 2025 test, CDSE returned marginally more S1C than ASF (54 vs 46) and is faster, so **CDSE / CDSE S3 is the best choice for S1C**, but ASF works.
+- Same dual-pol VV+VH, same footprints — S1C simply adds revisit density.
+
+> **⚠ Recent data — prefer CDSE.** ASF is a *mirror* of ESA's archive, so the newest scenes (roughly the last few days) can be missing from ASF until it catches up, and ASF only began ingesting Sentinel-1C on **30 April 2025** without backfilling the earliest S1C acquisitions. In a like-for-like 4-month 2025 test ASF returned a strict *subset* of CDSE (46 S1C vs 54) — the 8 it lacked were the earliest S1C scenes plus the single most-recent one. **If your date range includes very recent dates (or early-2025 S1C), use CDSE or CDSE S3** to be sure you get everything; ASF may silently return fewer scenes.
+
+Use the filter to **backfill**: if an AOI was downloaded before S1C existed, select **S1C only** + source **CDSE S3** and re-run — it fetches just the missing S1C scenes (existing ones are skipped by the existing-file check).
 
 **Authentication — CDSE:** refresh/offline token only — no email/password path exists in this app, so a CDSE password is never entered or stored. Paste the token in section 6b; the code exchanges it for a short-lived JWT Bearer token via Keycloak and renews it automatically. The pasted refresh token itself is valid ~60 min from when Copernicus issues it, so generate it right before starting a download. See [how to generate a CDSE refresh token](https://documentation.dataspace.copernicus.eu/APIs/Token.html) (the token-generation request returns a `refresh_token` field alongside the access token).
 
@@ -548,6 +573,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*
+- ~~**CDSE S3 direct download (S1)**~~ *(done — Download tab, section 6c; fastest source, bypasses the OData throttle and skips unzip; ~112 Mbit/s measured vs 7–67 for the other sources — see Downloads section)*
 - ~~**Raster Calculator (S1 & S2)**~~ *(done — 🧮 Raster Calc tab in both UIs)*
 - ~~**Custom Bands (S1)**~~ *(done — Processing tab, numpy expressions with VV/VH/CR/RVI/DIFF)*
 - ~~**Custom Indices (S2)**~~ *(done — Processing tab, numpy expressions with B2–B12)*

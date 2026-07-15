@@ -563,8 +563,13 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             token = cfg.get("asf_token","").strip()
             _sess = None
             try:
-                _sess = (_asf2.ASFSession().auth_with_token(token) if token
-                         else _asf2.ASFSession().auth_with_netrc())
+                if token:
+                    _sess = _asf2.ASFSession().auth_with_token(token)
+                else:
+                    # asf_search 8+ dropped auth_with_netrc — read ~/.netrc ourselves
+                    import netrc as _netrc
+                    _u, _, _p = _netrc.netrc().authenticators("urs.earthdata.nasa.gov")
+                    _sess = _asf2.ASFSession().auth_with_creds(_u, _p)
             except Exception as _re:
                 log(f"  Retry auth failed: {_re}")
             if _sess is not None:
@@ -767,8 +772,13 @@ def _download(cfg, safe_dir, log, progress_cb=None):
                    if r.properties.get("flightDirection","").upper() == direction]
         log(f"After {orbit_filter} filter: {len(results)} scenes")
 
+    _sats = _selected_sats(cfg)
+    if _sats:
+        results = [r for r in results if r.properties.get("sceneName", "")[:3] in _sats]
+        log(f"Satellite filter {sorted(_sats)}: {len(results)} scene(s)")
+
     if not results:
-        log("No scenes found — check AOI, dates and orbit selection")
+        log("No scenes found — check AOI, dates, orbit and satellite selection")
         return
 
     # authenticate — Earthdata Bearer token, else .netrc. Username/password is
@@ -913,6 +923,109 @@ def _cdse_auth_data(cfg):
         " switch 'Download source' to ASF instead.")
 
 
+def _selected_sats(cfg):
+    """Set of satellite codes to keep (e.g. {'S1C'}), or None to keep all.
+    Used to fetch only certain platforms — e.g. S1C-only to backfill AOIs already
+    downloaded from ASF (which has no S1C). Codes match the scene-name prefix."""
+    sats = cfg.get("satellites")
+    if not sats:
+        return None
+    s = {x.upper() for x in sats}
+    return None if s >= {"S1A", "S1B", "S1C"} else s
+
+
+def _cdse_search(cfg, log):
+    """Search the CDSE catalogue (public OData, no auth) for Sentinel-1 IW GRDH
+    scenes over the AOI + date range. Returns a list of product dicts (each has
+    Name, Id, S3Path, ContentDate, Attributes). Shared by the CDSE OData and S3
+    downloaders. Returns [] if nothing matches."""
+    import requests
+    import geopandas as gpd
+    from shapely.wkt import dumps as _wkt_dumps
+
+    aoi_path = cfg["aoi_path"]
+    gdf = gpd.read_file(aoi_path).to_crs("EPSG:4326")
+    union = _safe_union(gdf)
+    # ponytail: MultiPolygon AOIs (multiple field clusters) have no .exterior,
+    # so vertex count must recurse into .geoms or a scattered-cluster AOI's
+    # full detailed shape gets sent as WKT and CDSE 414s on the URL length.
+    def _vertex_count(geom):
+        if hasattr(geom, "geoms"):
+            return sum(_vertex_count(g) for g in geom.geoms)
+        return len(geom.exterior.coords) if hasattr(geom, "exterior") else 0
+    search_geom = union.convex_hull if _vertex_count(union) > 50 else union
+    aoi_wkt = _wkt_dumps(search_geom, rounding_precision=4)
+
+    start_str    = cfg["start_date"]
+    end_str      = cfg["end_date"]
+    orbit_filter = cfg.get("orbit_dir", "Both")
+
+    orbit_clause = ""
+    if orbit_filter != "Both":
+        direction = "ASCENDING" if orbit_filter == "ASC" else "DESCENDING"
+        orbit_clause = (
+            " and Attributes/OData.CSC.StringAttribute/any(att:"
+            "att/Name eq 'orbitDirection' and "
+            f"att/OData.CSC.StringAttribute/Value eq '{direction}')")
+
+    # ponytail: the strict `polarisationChannels eq 'VV&VH'` clause was dropped
+    # (B1) — the '&' encoding is brittle in OData and silently returned 0 hits.
+    # IW_GRDH is VV+VH in practice; check_safe handles the odd single-pol scene.
+    odata_filter = (
+        "Collection/Name eq 'SENTINEL-1'"
+        " and Attributes/OData.CSC.StringAttribute/any(att:"
+        "att/Name eq 'productType' and "
+        "att/OData.CSC.StringAttribute/Value eq 'IW_GRDH_1S')"
+        f" and ContentDate/Start ge {start_str}T00:00:00.000Z"
+        f" and ContentDate/Start le {end_str}T23:59:59.000Z"
+        f" and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}')"
+        f"{orbit_clause}"
+    )
+
+    SEARCH_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+    log(f"Searching CDSE: {start_str} → {end_str}")
+    all_items = []
+    skip, page = 0, 100
+    while True:
+        resp = requests.get(SEARCH_URL, params={
+            "$filter":  odata_filter,
+            "$orderby": "ContentDate/Start",
+            "$top":     page,
+            "$skip":    skip,
+            "$expand":  "Attributes",
+        }, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"CDSE search error (HTTP {resp.status_code}): {resp.text[:300]}")
+        items = resp.json().get("value", [])
+        all_items.extend(items)
+        if len(items) < page:
+            break
+        skip += page
+        if skip > 10_000:
+            log("  ⚠ Search hit the 10 000-result cap — the scene list is INCOMPLETE. "
+                "Narrow the date range (or split it) and re-run to get the rest.")
+            break
+
+    log(f"Found {len(all_items)} scenes total")
+
+    # Retry run: keep only scenes acquired on the failed dates.
+    _retry_dates = cfg.get("retry_dates")
+    if _retry_dates:
+        all_items = [it for it in all_items
+                     if it.get("ContentDate", {}).get("Start", "")[:10] in _retry_dates]
+        log(f"Retry filter: {len(all_items)} scene(s) on {len(_retry_dates)} failed date(s)")
+
+    _sats = _selected_sats(cfg)
+    if _sats:
+        all_items = [it for it in all_items if it.get("Name", "")[:3] in _sats]
+        log(f"Satellite filter {sorted(_sats)}: {len(all_items)} scene(s)")
+
+    if not all_items:
+        log("No scenes found — check AOI, dates, orbit and satellite selection")
+    return all_items
+
+
 def _download_cdse(cfg, safe_dir, log, progress_cb=None):
     """Download S1 GRD scenes from Copernicus Data Space Ecosystem (CDSE)."""
     if progress_cb is None:
@@ -980,83 +1093,8 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
     log("  Authenticated with CDSE")
     _token_ts = time.time()   # track when token was issued (expires ~600 s)
 
-    # ── Build AOI WKT ─────────────────────────────────────────────────────────
-    aoi_path = cfg["aoi_path"]
-    gdf = gpd.read_file(aoi_path).to_crs("EPSG:4326")
-    union = _safe_union(gdf)
-    # ponytail: MultiPolygon AOIs (multiple field clusters) have no .exterior,
-    # so vertex count must recurse into .geoms or a scattered-cluster AOI's
-    # full detailed shape gets sent as WKT and CDSE 414s on the URL length.
-    def _vertex_count(geom):
-        if hasattr(geom, "geoms"):
-            return sum(_vertex_count(g) for g in geom.geoms)
-        return len(geom.exterior.coords) if hasattr(geom, "exterior") else 0
-    search_geom = union.convex_hull if _vertex_count(union) > 50 else union
-    aoi_wkt = _wkt_dumps(search_geom, rounding_precision=4)
-
-    start_str    = cfg["start_date"]
-    end_str      = cfg["end_date"]
-    orbit_filter = cfg.get("orbit_dir", "Both")
-
-    orbit_clause = ""
-    if orbit_filter != "Both":
-        direction = "ASCENDING" if orbit_filter == "ASC" else "DESCENDING"
-        orbit_clause = (
-            " and Attributes/OData.CSC.StringAttribute/any(att:"
-            "att/Name eq 'orbitDirection' and "
-            f"att/OData.CSC.StringAttribute/Value eq '{direction}')")
-
-    # ponytail: the strict `polarisationChannels eq 'VV&VH'` clause was dropped
-    # (B1) — the '&' encoding is brittle in OData and silently returned 0 hits.
-    # IW_GRDH is VV+VH in practice; check_safe handles the odd single-pol scene.
-    odata_filter = (
-        "Collection/Name eq 'SENTINEL-1'"
-        " and Attributes/OData.CSC.StringAttribute/any(att:"
-        "att/Name eq 'productType' and "
-        "att/OData.CSC.StringAttribute/Value eq 'IW_GRDH_1S')"
-        f" and ContentDate/Start ge {start_str}T00:00:00.000Z"
-        f" and ContentDate/Start le {end_str}T23:59:59.000Z"
-        f" and OData.CSC.Intersects(area=geography'SRID=4326;{aoi_wkt}')"
-        f"{orbit_clause}"
-    )
-
-    # ── Search (paginated) ────────────────────────────────────────────────────
-    SEARCH_URL = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
-    log(f"Searching CDSE: {start_str} → {end_str}")
-    all_items = []
-    skip, page = 0, 100
-    while True:
-        resp = requests.get(SEARCH_URL, params={
-            "$filter":  odata_filter,
-            "$orderby": "ContentDate/Start",
-            "$top":     page,
-            "$skip":    skip,
-            "$expand":  "Attributes",
-        }, timeout=30)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"CDSE search error (HTTP {resp.status_code}): {resp.text[:300]}")
-        items = resp.json().get("value", [])
-        all_items.extend(items)
-        if len(items) < page:
-            break
-        skip += page
-        if skip > 10_000:
-            log("  ⚠ Search hit the 10 000-result cap — the scene list is INCOMPLETE. "
-                "Narrow the date range (or split it) and re-run to get the rest.")
-            break
-
-    log(f"Found {len(all_items)} scenes total")
-
-    # Retry run: keep only scenes acquired on the failed dates.
-    _retry_dates = cfg.get("retry_dates")
-    if _retry_dates:
-        all_items = [it for it in all_items
-                     if it.get("ContentDate", {}).get("Start", "")[:10] in _retry_dates]
-        log(f"Retry filter: {len(all_items)} scene(s) on {len(_retry_dates)} failed date(s)")
-
+    all_items = _cdse_search(cfg, log)
     if not all_items:
-        log("No scenes found — check AOI, dates and orbit selection")
         return []
 
     # ── Download loop (parallel) ──────────────────────────────────────────────
@@ -1067,6 +1105,7 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
     _stop_ev   = cfg.get("stop_event")
+    _force_ev  = cfg.get("force_event")   # 2nd Stop press → abort the in-flight scene too
     n_workers  = max(1, min(cfg.get("max_dl_workers", 1), 5))
     n_dl       = len(all_items)
     dl_done    = 0
@@ -1094,9 +1133,13 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                 dirn = "ASC" if a.get("Value","").upper().startswith("ASC") else "DSC"
                 break
 
-        safe_name = name if name.endswith(".SAFE") else name + ".SAFE"
-        safe_path = os.path.join(safe_dir, safe_name)
-        zip_path  = os.path.join(safe_dir, name + ".zip")
+        # Normalise to the bare product id (drop CDSE's trailing .SAFE) so the
+        # zip is named <product>.zip exactly like ASF's. One spelling means a
+        # scene already fetched from either source is recognised — and skipped —
+        # by the other, and unzip yields <product>.SAFE, not <product>.SAFE.SAFE.
+        base      = name[:-5] if name.endswith(".SAFE") else name
+        safe_path = os.path.join(safe_dir, base + ".SAFE")
+        zip_path  = os.path.join(safe_dir, base + ".zip")
 
         if os.path.isdir(safe_path) or os.path.isfile(zip_path):
             with _lock:
@@ -1174,7 +1217,10 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                     _last_emit = time.time()
                     with open(zip_tmp, mode) as fh:
                         for chunk in r.iter_content(chunk_size=65536):
-                            if _stop_ev and _stop_ev.is_set():
+                            # Graceful stop lets the in-flight scene finish (like ASF,
+                            # whose blocking download has no mid-stream hook); only a
+                            # 2nd Stop press (force) aborts mid-transfer.
+                            if _force_ev and _force_ev.is_set():
                                 break
                             if chunk:
                                 fh.write(chunk); written += len(chunk)
@@ -1193,8 +1239,8 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                                                 speed=f"{_mbps:.0f} Mbps")
                                     _last_emit = _now
 
-                if _stop_ev and _stop_ev.is_set():
-                    # keep the .part file so a later run can resume
+                if _force_ev and _force_ev.is_set():
+                    # force-killed mid-scene — keep the .part so a later run resumes
                     return None
 
                 os.rename(zip_tmp, zip_path)
@@ -1239,6 +1285,196 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
     return failed
 
 
+def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
+    """Download .SAFE products straight from CDSE's S3 object store (eodata bucket).
+
+    Bypasses the OData /$value session throttle and delivers the already-extracted
+    .SAFE folder, so there is NO unzip step. Each S3 credential is capped by CDSE at
+    ~20 MB/s (160 Mbit/s) and 12 TB/month. Needs S3 keys (section 6c) generated at the
+    CDSE S3 keys manager. Scenes are fetched one at a time (graceful Stop finishes the
+    current scene, a 2nd Stop aborts it); the many files inside each .SAFE are pulled
+    in parallel — that is where the speed comes from."""
+    if progress_cb is None:
+        progress_cb = lambda *a, **kw: None
+    try:
+        import boto3
+        from botocore.config import Config as _BotoCfg
+    except ImportError:
+        raise ImportError("boto3 needed for CDSE S3. Run: pip install boto3")
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed2
+
+    ak = cfg.get("s3_access", "").strip()
+    sk = cfg.get("s3_secret", "").strip()
+    if not (ak and sk):
+        raise RuntimeError(
+            "No CDSE S3 keys configured.\n"
+            "Generate an access key + secret at\n"
+            "https://eodata-s3keysmanager.dataspace.copernicus.eu/\n"
+            "and enter them in section 6c, or switch 'Download source' to ASF/CDSE.")
+
+    all_items = _cdse_search(cfg, log)
+    if not all_items:
+        return []
+
+    _stop_ev  = cfg.get("stop_event")
+    _force_ev = cfg.get("force_event")
+    N_OBJ     = max(1, min(int(cfg.get("s3_workers", 8)), 16))      # parallel files per scene
+    n_scenes  = max(1, min(int(cfg.get("max_dl_workers", 1)), 5))   # scenes in parallel (section 7)
+    n_dl      = len(all_items)
+    failed    = []
+    _done     = [0]
+    _lock     = threading.Lock()
+
+    s3 = boto3.client(
+        "s3", endpoint_url="https://eodata.dataspace.copernicus.eu",
+        aws_access_key_id=ak, aws_secret_access_key=sk, region_name="default",
+        config=_BotoCfg(signature_version="s3v4", s3={"addressing_style": "path"},
+                        max_pool_connections=min(n_scenes * N_OBJ + 4, 64),
+                        retries={"max_attempts": 4, "mode": "standard"}))
+
+    _chk_zip, chk_safe = _load_integrity_checker()
+    log(f"  Download mode: CDSE S3 ({n_scenes} scene(s) × {N_OBJ} files at once)"
+        f"  —  no unzip, ~20 MB/s cap per key")
+
+    def _list_objects(prefix):
+        objs, tok = [], None
+        while True:
+            kw = {"Bucket": "eodata", "Prefix": prefix}
+            if tok:
+                kw["ContinuationToken"] = tok
+            r = s3.list_objects_v2(**kw)
+            objs += r.get("Contents", [])
+            if not r.get("IsTruncated"):
+                break
+            tok = r.get("NextContinuationToken")
+        return objs
+
+    def _dl_scene(args):
+        i, scene = args
+        if _stop_ev and _stop_ev.is_set():
+            return   # graceful stop: don't start new scenes
+
+        name = scene.get("Name", "")
+        base = name[:-5] if name.endswith(".SAFE") else name
+        date = scene.get("ContentDate", {}).get("Start", "")[:10]
+        dirn = "?"
+        for a in scene.get("Attributes", []):
+            if a.get("Name") == "orbitDirection":
+                dirn = "ASC" if a.get("Value", "").upper().startswith("ASC") else "DSC"
+                break
+
+        safe_path = os.path.join(safe_dir, base + ".SAFE")
+        zip_path  = os.path.join(safe_dir, base + ".zip")
+        if os.path.isdir(safe_path) or os.path.isfile(zip_path):
+            with _lock: _done[0] += 1; _c = _done[0]
+            log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  (exists)")
+            progress_cb("download", _c, n_dl, f"{date} {dirn}  skip")
+            return
+
+        s3path = scene.get("S3Path", "")
+        if not s3path:
+            _write_error(cfg, name, "download_s3", "product has no S3Path")
+            with _lock: failed.append(scene); _done[0] += 1; _c = _done[0]
+            log(f"  [{i}/{n_dl}] ✗ {date} {dirn}  (no S3Path)")
+            progress_cb("download", _c, n_dl, f"{date} {dirn}  ✗")
+            return
+        prefix = s3path.lstrip("/").split("/", 1)[1]   # key prefix inside 'eodata' bucket
+
+        log(f"  [{i}/{n_dl}] ↓ {date} {dirn}  {base[:38]}…")
+        t0 = time.time()
+        try:
+            objs = [o for o in _list_objects(prefix)
+                    if os.path.relpath(o["Key"], prefix) not in (".", "")]
+            if not objs:
+                raise RuntimeError("no objects under S3 prefix")
+            total_sz = sum(o["Size"] for o in objs) or 1
+            part_dir = safe_path + ".partdir"
+
+            got  = [0]; _blk = threading.Lock(); _last = [time.time()]
+            def _fetch(o):
+                if _force_ev and _force_ev.is_set():
+                    return
+                rel = os.path.relpath(o["Key"], prefix).replace("/", os.sep)
+                dst = os.path.join(part_dir, rel)
+                # resume: skip a file already fully downloaded (same size)
+                if os.path.isfile(dst) and os.path.getsize(dst) == o["Size"]:
+                    with _blk: got[0] += o["Size"]
+                    return
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                s3.download_file("eodata", o["Key"], dst)
+                with _blk:
+                    got[0] += o["Size"]
+                    _now = time.time()
+                    if _now - _last[0] >= 1.0:
+                        _el = _now - t0
+                        _mbps = got[0] * 8 / _el / 1e6 if _el > 0 else 0
+                        with _lock: _c = _done[0]
+                        progress_cb("download", _c, n_dl,
+                                    f"↓ {date} {got[0]/total_sz*100:.0f}% "
+                                    f"{got[0]/1_048_576:.0f}MB {_mbps:.0f}Mbps",
+                                    speed=f"{_mbps:.0f} Mbps")
+                        _last[0] = _now
+
+            with ThreadPoolExecutor(max_workers=N_OBJ) as fpool:
+                list(fpool.map(_fetch, objs))
+
+            if _force_ev and _force_ev.is_set():
+                log(f"     [Force-stopped mid-scene {base[:28]} — partial .SAFE kept for resume]")
+                return
+
+            # partdir now holds the .SAFE contents → move it into place atomically
+            if os.path.isdir(safe_path):
+                shutil.rmtree(safe_path, ignore_errors=True)
+            os.replace(part_dir, safe_path)
+
+            if chk_safe is not None:
+                try:
+                    _st, _why = chk_safe(safe_path, deep=True)
+                except Exception:
+                    _st, _why = "OK", []
+                if _st == "CORRUPT":
+                    log(f"     ✗ {base}.SAFE failed integrity check — {'; '.join(_why)}")
+                    _write_error(cfg, name, "download_s3",
+                                 "Integrity check failed:\n" + "\n".join(_why))
+                    shutil.rmtree(safe_path, ignore_errors=True)
+                    with _lock: failed.append(scene); _done[0] += 1; _c = _done[0]
+                    progress_cb("download", _c, n_dl, f"{date} {dirn}  ✗")
+                    return
+
+            elapsed = time.time() - t0
+            mb  = total_sz / 1_048_576
+            spd = f"{mb*8/elapsed:.0f} Mbps" if elapsed > 0 else ""
+            with _lock: _done[0] += 1; _c = _done[0]
+            log(f"     ✓  {base[:28]}  {elapsed:.0f}s  {mb:.0f} MB  {spd}")
+            _clear_error(cfg, name, "download_s3")
+            progress_cb("download", _c, n_dl, f"{date} {dirn} ✓ {mb:.0f}MB {spd}", speed=spd)
+
+        except Exception as e:
+            _write_error(cfg, name, "download_s3", f"{e}")
+            log(f"     ✗ ERROR {base[:28]}: {e}")
+            with _lock: failed.append(scene); _done[0] += 1; _c = _done[0]
+            progress_cb("download", _c, n_dl, f"{date} {dirn}  ✗")
+
+    # Scenes in parallel (section 7 spinner); each scene's files in parallel (N_OBJ).
+    with ThreadPoolExecutor(max_workers=n_scenes) as pool:
+        futs = [pool.submit(_dl_scene, (i, s)) for i, s in enumerate(all_items, 1)]
+        for f in _as_completed2(futs):
+            try:
+                f.result()
+            except Exception as e:
+                log(f"  [UNEXPECTED S3 error] {e}")
+
+    # S3 scenes arrive already extracted, but a previous ASF/CDSE run may have left
+    # loose .zip archives (which we skipped above). Extract those so SNAP finds them
+    # too — _unzip_zips only touches .zip files, so S3 .SAFE folders are ignored.
+    _unzip_zips(safe_dir, log, progress_cb, _stop_ev, cfg)
+    return failed
+
+
+def _has_s3_creds(cfg):
+    return bool(cfg.get("s3_access", "").strip() and cfg.get("s3_secret", "").strip())
+
+
 def _has_asf_creds(cfg):
     return bool(cfg.get("asf_token", "").strip())
 
@@ -1261,8 +1497,14 @@ def _download_dispatch(cfg, safe_dir, log, progress_cb=None):
     if src == "cdse":
         log("\n── STEP 1: Downloading .SAFE from Copernicus CDSE ──")
         return _download_cdse(cfg, safe_dir, log, progress_cb) or []
+    if src == "cdse_s3":
+        log("\n── STEP 1: Downloading .SAFE from CDSE S3 ──")
+        return _download_cdse_s3(cfg, safe_dir, log, progress_cb) or []
 
+    # auto: fastest source first (S3 → CDSE OData → ASF), fall back on hard failure
     candidates = []
+    if _has_s3_creds(cfg):
+        candidates.append(("CDSE S3", _download_cdse_s3))
     if _has_cdse_creds(cfg):
         candidates.append(("Copernicus CDSE", _download_cdse))
     if _has_asf_creds(cfg):
@@ -1270,8 +1512,8 @@ def _download_dispatch(cfg, safe_dir, log, progress_cb=None):
     if not candidates:
         raise RuntimeError(
             "No download credentials configured.\n"
-            "Enter an ASF Earthdata token (section 6), or a CDSE"
-            " username/password (section 6b).")
+            "Enter an ASF Earthdata token (section 6), a CDSE"
+            " username/password (section 6b), or CDSE S3 keys (section 6c).")
 
     last_err = None
     for i, (label, fn) in enumerate(candidates):
@@ -3296,6 +3538,7 @@ class App(tk.Tk):
         self._running    = False
         self._thread     = None
         self._stop_event = threading.Event()
+        self._force_event = threading.Event()  # set on 2nd Stop press → abort in-flight download
         self._cur_procs  = set()              # live SNAP/GPT subprocesses
         self._proc_lock  = threading.Lock()   # guards _cur_procs
         self._dep_results = {}  # filled by dep check; used to block START if critical missing
@@ -3765,10 +4008,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         t_proc = tk.Frame(nb, bg=BG)
         t_out  = tk.Frame(nb, bg=BG)
         t_calc = tk.Frame(nb, bg=BG)
+        t_batch = tk.Frame(nb, bg=BG)
         nb.add(t_dl,   text="  ⬇  Download  ")
         nb.add(t_proc, text="  ⚙  Processing  ")
         nb.add(t_out,  text="  📁  Output  ")
         nb.add(t_calc, text="  🧮  Raster Calc  ")
+        nb.add(t_batch, text="  🗂  Batch  ")
 
         # ── DOWNLOAD TAB ─────────────────────────────────────────────────
         p = self._make_tab_scroll(t_dl)
@@ -3793,6 +4038,11 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                                bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
                                activebackground=BG, activeforeground=ACCENT_L,
                                command=self._on_source_change)
+        rb_cdse_s3 = tk.Radiobutton(src_fr, text="Download from CDSE S3  (fastest, no unzip; needs S3 keys — section 6c)",
+                               variable=self.v_safe_source, value="cdse_s3",
+                               bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
+                               activebackground=BG, activeforeground=ACCENT_L,
+                               command=self._on_source_change)
         rb_ex = tk.Radiobutton(src_fr, text="Use existing .SAFE folder",
                                variable=self.v_safe_source, value="existing",
                                bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
@@ -3806,6 +4056,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         rb_auto.pack(anchor="w")
         rb_dl.pack(anchor="w")
         rb_cdse.pack(anchor="w")
+        rb_cdse_s3.pack(anchor="w")
         rb_ex.pack(anchor="w")
         rb_ex_snap.pack(anchor="w")
 
@@ -3927,6 +4178,20 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                            bg=BG, font=FONT, fg=FG, selectcolor=BG2,
                            activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=6)
 
+        # ── Satellites ─────────────────────────────────────────────────────
+        self._section(p, "5b. Satellites")
+        _saved_sats = set(self._saved_cfg.get("satellites", ["S1A", "S1B", "S1C"]))
+        self.v_sat = {s: tk.BooleanVar(value=(s in _saved_sats)) for s in ("S1A", "S1B", "S1C")}
+        sat_fr = tk.Frame(p, bg=BG); sat_fr.pack(padx=14, anchor="w")
+        for s in ("S1A", "S1B", "S1C"):
+            tk.Checkbutton(sat_fr, text=s, variable=self.v_sat[s], bg=BG, font=FONT, fg=FG,
+                           selectcolor=BG2, activebackground=BG,
+                           activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=6)
+        tk.Label(p, text="  Pick which satellites to fetch. Tip: select only S1C to backfill AOIs downloaded\n"
+                         "  before S1C existed. All sources now return S1C (asf_search ≥ 8.1.3); CDSE / CDSE S3\n"
+                         "  tend to be slightly more complete and faster for it.",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(2, 0))
+
         # ── Credentials ───────────────────────────────────────────────────
         self._section(p, "6. ASF Credentials  (NASA Earthdata)")
         cfg_s = self._saved_cfg
@@ -4013,8 +4278,53 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                  text="  (username + password stored in sar_foundry_config.json — plain text)",
                  font=(_FONT_FAM,8), bg=BG, fg=FG2).pack(anchor="w")
 
+        # ── CDSE S3 keys (fastest download) ───────────────────────────────
+        self._section(p, "6c. CDSE S3 Keys  (fastest download)")
+        self.v_s3_access = tk.StringVar(value=cfg_s2.get("s3_access", ""))
+        self.v_s3_secret = tk.StringVar(value=cfg_s2.get("s3_secret", ""))
+        try:    _s3w = int(cfg_s2.get("s3_workers", 8))
+        except Exception: _s3w = 8
+        self.v_s3_workers = tk.IntVar(value=max(1, min(_s3w, 16)))
+        tk.Label(p, text="  Direct S3 download from the CDSE object store — bypasses the OData"
+                         " throttle and needs no unzip.\n  Capped at ~20 MB/s (160 Mbit/s) and"
+                         " 12 TB/month per key. Uses the same AOI/dates/orbit as CDSE.",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(6,0))
+        row_sa = tk.Frame(p, bg=BG); row_sa.pack(fill=tk.X, padx=14, pady=2)
+        tk.Label(row_sa, text="S3 access key", font=FONT, bg=BG, fg=FG,
+                 width=18, anchor="w").pack(side=tk.LEFT)
+        tk.Entry(row_sa, textvariable=self.v_s3_access, font=FONT,
+                 bg=BG2, fg=FG, insertbackground=FG,
+                 relief="flat", bd=4).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        row_ss = tk.Frame(p, bg=BG); row_ss.pack(fill=tk.X, padx=14, pady=2)
+        tk.Label(row_ss, text="S3 secret key", font=FONT, bg=BG, fg=FG,
+                 width=18, anchor="w").pack(side=tk.LEFT)
+        tk.Entry(row_ss, textvariable=self.v_s3_secret, font=FONT, show="*",
+                 bg=BG2, fg=FG, insertbackground=FG,
+                 relief="flat", bd=4).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        s3_reg_fr = tk.Frame(p, bg=BG); s3_reg_fr.pack(fill=tk.X, padx=14, pady=(2,4))
+        tk.Label(s3_reg_fr, text="No keys?", font=(_FONT_FAM,9), bg=BG, fg=FG2).pack(side=tk.LEFT)
+        def _open_s3keys():
+            import webbrowser
+            webbrowser.open("https://eodata-s3keysmanager.dataspace.copernicus.eu/")
+        tk.Button(s3_reg_fr, text="Generate S3 keys at CDSE →",
+                  font=(_FONT_FAM,9,"underline"), bg=BG, fg=ACCENT,
+                  relief="flat", cursor="hand2",
+                  command=_open_s3keys).pack(side=tk.LEFT, padx=(4,0))
+        tk.Label(p, text="  (stored in sar_foundry_config.json — plain text, only if 'Remember' is ticked)",
+                 font=(_FONT_FAM,8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(0,4))
+        row_s3w = tk.Frame(p, bg=BG); row_s3w.pack(fill=tk.X, padx=14, pady=(2,0))
+        tk.Label(row_s3w, text="Parallel files / scene", font=FONT, bg=BG, fg=FG,
+                 width=22, anchor="w").pack(side=tk.LEFT)
+        tk.Spinbox(row_s3w, from_=1, to=16, width=4, textvariable=self.v_s3_workers,
+                   font=FONT, bg=BG2, fg=FG, insertbackground=FG, relief="flat",
+                   justify="center").pack(side=tk.LEFT)
+        tk.Label(p, text="  How many files within each .SAFE download at once (S3 only). More is not"
+                         " always faster — the 20 MB/s per-key cap means ~8 usually saturates it;"
+                         " lower it if the link feels congested.",
+                 font=(_FONT_FAM,8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(0,4))
+
         # ── Parallel download ─────────────────────────────────────────────
-        self._section(p, "7. Parallel Downloads (CDSE only)")
+        self._section(p, "7. Parallel Downloads (CDSE & CDSE S3)")
         self.v_dl_workers = tk.IntVar(
             value=max(1, min(int(self._saved_cfg.get("max_dl_workers", 1)), 5)))
         row_dw = tk.Frame(p, bg=BG); row_dw.pack(fill=tk.X, padx=14, pady=(4, 0))
@@ -4023,8 +4333,10 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         tk.Spinbox(row_dw, from_=1, to=5, width=4, textvariable=self.v_dl_workers,
                    font=FONT, bg=BG2, fg=FG, insertbackground=FG, relief="flat",
                    justify="center").pack(side=tk.LEFT)
-        tk.Label(p, text="  CDSE serves from object storage — 3–5 parallel downloads are safe and much faster.\n"
-                         "  Ignored for ASF: ASF throttles parallel connections and corrupts VV bands,\n"
+        tk.Label(p, text="  How many scenes download at once. CDSE object storage handles 3–5 safely.\n"
+                         "  For CDSE S3 this stacks with 'Parallel files / scene' (6c) toward the 20 MB/s\n"
+                         "  per-key cap — a single scene rarely saturates it, so 3–5 scenes helps.\n"
+                         "  Ignored for ASF: it throttles parallel connections and corrupts VV bands,\n"
                          "  so ASF always downloads sequentially (1 at a time) regardless of this setting.",
                  font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(2, 4))
 
@@ -4468,6 +4780,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._btn(p, "■  Stop", self._on_stop_calc, color=RED,
                   pady=8, font=(_FONT_FAM,10,"bold")).pack(fill=tk.X, padx=14, pady=(0,8))
 
+        # ── BATCH TAB ────────────────────────────────────────────────────
+        self._build_batch_tab(t_batch)
+
         # ── FIXED FOOTER: Run / Stop / History ───────────────────────────
         footer = tk.Frame(parent, bg=BG2)
         footer.pack(fill=tk.X, side=tk.BOTTOM, pady=(0, 0))
@@ -4894,11 +5209,14 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 "asf_token":       self.v_token.get(),
                 "cdse_user":       self.v_cdse_user.get(),
                 "cdse_pass":       self.v_cdse_pass.get(),
+                "s3_access":       self.v_s3_access.get(),
+                "s3_secret":       self.v_s3_secret.get(),
                 "remember_creds":  True,
             })
         else:
             _save_config({"remember_creds": False,
-                          "asf_token": "", "cdse_user": "", "cdse_pass": ""})
+                          "asf_token": "", "cdse_user": "", "cdse_pass": "",
+                          "s3_access": "", "s3_secret": ""})
     def _on_graph_preset_change(self):
         if self.v_graph_preset.get() == "custom":
             self.custom_graph_fr.pack(fill=tk.X, padx=4, pady=(2,4))
@@ -5125,6 +5443,311 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             if hasattr(self, "chk_snap"):
                 self.chk_snap.configure(state=tk.NORMAL)
 
+    # ── Batch AOI runner ────────────────────────────────────────────────
+    def _mk_optmenu(self, parent, var, options):
+        om = tk.OptionMenu(parent, var, *options)
+        om.configure(bg=BG2, fg=FG, activebackground=BG, activeforeground=ACCENT_L,
+                     relief="flat", font=(_FONT_FAM, 9), highlightthickness=0, width=8)
+        om["menu"].configure(bg=BG2, fg=FG, activebackground=ACCENT2, activeforeground=WHITE)
+        return om
+
+    def _build_batch_tab(self, parent):
+        p = self._make_tab_scroll(parent)
+        self._batch_aois = []
+        self._batch_per_aoi = {}   # aoi_path -> (preset_var, speckle_var)
+
+        tk.Label(p, text="Batch: process many AOIs in one sequential run. Each AOI (and each\n"
+                         "pipeline) gets its own auto-named output folder. AOIs run one after another.",
+                 font=(_FONT_FAM, 9), bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(10, 4))
+
+        # 1. AOI files
+        self._section(p, "1. AOI files")
+        lb_fr = tk.Frame(p, bg=BG); lb_fr.pack(fill=tk.X, padx=14, pady=(2, 2))
+        self.batch_listbox = tk.Listbox(lb_fr, height=6, font=(_FONT_FAM, 9),
+                                        bg=BG2, fg=FG, selectbackground=ACCENT2,
+                                        relief="flat", highlightthickness=0, activestyle="none",
+                                        selectmode=tk.EXTENDED)
+        self.batch_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        _sb = tk.Scrollbar(lb_fr, command=self.batch_listbox.yview); _sb.pack(side=tk.LEFT, fill=tk.Y)
+        self.batch_listbox.config(yscrollcommand=_sb.set)
+        btns = tk.Frame(p, bg=BG); btns.pack(fill=tk.X, padx=14, pady=(2, 4))
+        self._btn(btns, "＋ Add files…", self._batch_add_files, color=BG2).pack(side=tk.LEFT)
+        self._btn(btns, "📁 Add folder…", self._batch_add_folder, color=BG2).pack(side=tk.LEFT, padx=4)
+        self._btn(btns, "－ Remove", self._batch_remove, color=BG2).pack(side=tk.LEFT)
+        self._btn(btns, "Clear", self._batch_clear, color=BG2).pack(side=tk.LEFT, padx=4)
+
+        # 2. Pipeline assignment
+        self._section(p, "2. Pipeline assignment")
+        self.v_batch_mode = tk.StringVar(value="uniform")
+        for _val, _lbl in [
+            ("uniform", "Same pipeline + speckle for all AOIs"),
+            ("all",     "All combinations — every AOI × selected pipelines × speckles"),
+            ("per_aoi", "Per-AOI — choose pipeline + speckle for each AOI"),
+        ]:
+            tk.Radiobutton(p, text=_lbl, variable=self.v_batch_mode, value=_val,
+                           bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
+                           activebackground=BG, activeforeground=ACCENT_L,
+                           command=self._on_batch_mode_change).pack(anchor="w", padx=14)
+
+        self.batch_uniform_fr = tk.Frame(p, bg=BG)
+        self.v_batch_preset  = tk.StringVar(value="sigma0")
+        self.v_batch_speckle = tk.StringVar(value="lee")
+        _u1 = tk.Frame(self.batch_uniform_fr, bg=BG); _u1.pack(fill=tk.X, padx=28, pady=2)
+        tk.Label(_u1, text="Pipeline", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
+        self._mk_optmenu(_u1, self.v_batch_preset, ["sigma0", "gamma0"]).pack(side=tk.LEFT)
+        tk.Label(_u1, text="  Speckle", font=FONT, bg=BG, fg=FG).pack(side=tk.LEFT)
+        self._mk_optmenu(_u1, self.v_batch_speckle, ["none", "lee", "gamma"]).pack(side=tk.LEFT)
+
+        self.batch_all_fr = tk.Frame(p, bg=BG)
+        self.v_batch_cp = {k: tk.BooleanVar(value=(k == "sigma0")) for k in ("sigma0", "gamma0")}
+        self.v_batch_cs = {k: tk.BooleanVar(value=(k == "lee"))    for k in ("none", "lee", "gamma")}
+        _c1 = tk.Frame(self.batch_all_fr, bg=BG); _c1.pack(fill=tk.X, padx=28, pady=2)
+        tk.Label(_c1, text="Pipelines", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
+        for k in ("sigma0", "gamma0"):
+            tk.Checkbutton(_c1, text=k, variable=self.v_batch_cp[k], bg=BG, font=FONT, fg=FG,
+                           selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=4)
+        _c2 = tk.Frame(self.batch_all_fr, bg=BG); _c2.pack(fill=tk.X, padx=28, pady=2)
+        tk.Label(_c2, text="Speckles", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
+        for k in ("none", "lee", "gamma"):
+            tk.Checkbutton(_c2, text=k, variable=self.v_batch_cs[k], bg=BG, font=FONT, fg=FG,
+                           selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=4)
+
+        self.batch_per_fr = tk.Frame(p, bg=BG)
+        tk.Label(self.batch_per_fr, text="  (one row per AOI — add AOIs above first)",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=28)
+        self.batch_per_rows = tk.Frame(self.batch_per_fr, bg=BG); self.batch_per_rows.pack(fill=tk.X, padx=28)
+
+        # 3. Output base
+        self._section(p, "3. Output base folder")
+        self.v_batch_out = tk.StringVar(value=self._saved_cfg.get("batch_out", ""))
+        row = tk.Frame(p, bg=BG); row.pack(fill=tk.X, padx=14, pady=2)
+        self._entry(row, self.v_batch_out).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._btn(row, "…", lambda: self._browse_dir(self.v_batch_out)).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Label(p, text="  Outputs →  <base>/<AOI>/<pipeline[_speckle]>/ ;  downloads shared per AOI in\n"
+                         "  <base>/<AOI>/_safe/ .  Dates, source, credentials, satellites, bands, scales and\n"
+                         "  workers come from the Download/Processing tabs.",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
+
+        self.btn_batch = self._btn(p, "▶  Run Batch", self._on_run_batch,
+                                   pady=10, font=(_FONT_FAM, 12, "bold"))
+        self.btn_batch.pack(fill=tk.X, padx=14, pady=(2, 8))
+        tk.Label(p, text="  Use the STOP button (bottom) to halt — the current AOI finishes, the rest are skipped.",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(0, 10))
+
+        self._on_batch_mode_change()
+
+    def _batch_add_files(self):
+        from tkinter import filedialog as _fd
+        paths = _fd.askopenfilenames(title="Select AOI files",
+                    filetypes=[("Vector", "*.geojson *.shp *.gpkg"), ("All", "*")])
+        for pth in paths:
+            if pth and pth not in self._batch_aois:
+                self._batch_aois.append(pth)
+        self._refresh_batch_listbox()
+
+    def _batch_add_folder(self):
+        from tkinter import filedialog as _fd
+        d = _fd.askdirectory(title="Folder of AOI files")
+        if not d:
+            return
+        found = []
+        for ext in ("*.geojson", "*.shp", "*.gpkg"):
+            found += glob.glob(os.path.join(d, ext))
+        for pth in sorted(found):
+            if pth not in self._batch_aois:
+                self._batch_aois.append(pth)
+        self._refresh_batch_listbox()
+
+    def _batch_remove(self):
+        for i in reversed(list(self.batch_listbox.curselection())):
+            del self._batch_aois[i]
+        self._refresh_batch_listbox()
+
+    def _batch_clear(self):
+        self._batch_aois = []
+        self._refresh_batch_listbox()
+
+    def _refresh_batch_listbox(self):
+        self.batch_listbox.delete(0, tk.END)
+        for pth in self._batch_aois:
+            self.batch_listbox.insert(tk.END, os.path.basename(pth))
+        if self.v_batch_mode.get() == "per_aoi":
+            self._rebuild_batch_per_aoi()
+
+    def _on_batch_mode_change(self):
+        for fr in (self.batch_uniform_fr, self.batch_all_fr, self.batch_per_fr):
+            fr.pack_forget()
+        m = self.v_batch_mode.get()
+        if m == "uniform":
+            self.batch_uniform_fr.pack(fill=tk.X, pady=(2, 4))
+        elif m == "all":
+            self.batch_all_fr.pack(fill=tk.X, pady=(2, 4))
+        else:
+            self.batch_per_fr.pack(fill=tk.X, pady=(2, 4))
+            self._rebuild_batch_per_aoi()
+
+    def _rebuild_batch_per_aoi(self):
+        for w in self.batch_per_rows.winfo_children():
+            w.destroy()
+        new_map = {}
+        for pth in self._batch_aois:
+            prev = self._batch_per_aoi.get(pth)
+            pv = prev[0] if prev else tk.StringVar(value="sigma0")
+            sv = prev[1] if prev else tk.StringVar(value="lee")
+            new_map[pth] = (pv, sv)
+            row = tk.Frame(self.batch_per_rows, bg=BG); row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=os.path.basename(pth)[:30], font=(_FONT_FAM, 8), bg=BG, fg=FG,
+                     width=32, anchor="w").pack(side=tk.LEFT)
+            self._mk_optmenu(row, pv, ["sigma0", "gamma0"]).pack(side=tk.LEFT)
+            self._mk_optmenu(row, sv, ["none", "lee", "gamma"]).pack(side=tk.LEFT, padx=4)
+        self._batch_per_aoi = new_map
+
+    def _batch_cfg(self, aoi_path, preset, speckle, out_base):
+        aoi_label = re.sub(r"[^A-Za-z0-9_-]", "_", Path(aoi_path).stem) or "AOI"
+        sub = preset + ("" if speckle in ("none", None, "") else f"_{speckle}")
+        aoi_root = os.path.join(out_base, aoi_label)
+        safe_dir = os.path.join(aoi_root, "_safe")            # per-AOI, shared across its combos
+        snap_dir = os.path.join(aoi_root, sub, "_snap")
+        out_dir  = os.path.join(aoi_root, sub)
+        graph_names = {"sigma0": "s1_sigma0_standard.xml", "gamma0": "s1_gamma0_rtc.xml"}
+        graph_path  = os.path.join(_SCRIPT_DIR, "snap_graphs", graph_names.get(preset, ""))
+        scales = []
+        if self.v_linear.get(): scales.append("linear")
+        if self.v_db.get():     scales.append("db")
+        if not scales:          scales = ["linear"]
+        return {
+            "aoi_path": aoi_path, "aoi_wkt": None, "aoi_label": aoi_label,
+            "start_date": self.v_start.get(), "end_date": self.v_end.get(),
+            "orbit_dir": self.v_orbit.get(),
+            "satellites": [s for s, v in self.v_sat.items() if v.get()] or ["S1A", "S1B", "S1C"],
+            "asf_token": self.v_token.get(),
+            "dl_source": self.v_safe_source.get() if self.v_safe_source.get() in ("cdse", "cdse_s3", "auto") else "asf",
+            "cdse_user": self.v_cdse_user.get(), "cdse_pass": self.v_cdse_pass.get(),
+            "s3_access": self.v_s3_access.get(), "s3_secret": self.v_s3_secret.get(),
+            "do_download": True, "do_snap": True, "do_indices": True,
+            "clean_snap": self.v_clean_snap.get(),
+            "clean_safe": False,   # keep .SAFE so an AOI's pipeline combos reuse the download
+            "bands": {b: self.v_bands[b].get() for b in ALL_BANDS},
+            "custom_bands": [
+                {"name": n.get().strip(), "expr": e.get().strip()}
+                for en, n, e in self.v_custom_bands
+                if en.get() and n.get().strip() and e.get().strip()
+            ],
+            "scales": scales,
+            "safe_dir": safe_dir, "snap_dir": snap_dir, "out_dir": out_dir,
+            "gpt_path": self.v_gpt.get(),
+            "graph_path": graph_path, "graph_preset": preset,
+            "speckle": speckle, "speckle_params": None,
+            "dem_name": self.v_dem.get(), "mosaic_method": self.v_mosaic_method.get(),
+            "cluster_aoi": bool(self.v_cluster_aoi.get()),
+            "cluster_gap_km": _safe_float(self.v_cluster_gap.get(), 5.0),
+            "fields_path": (self.v_fields_path.get() or "").strip(),
+            "retry_download": self.v_retry_dl.get(),
+            "max_dl_workers": int(self.v_dl_workers.get()),
+            "s3_workers": int(self.v_s3_workers.get()),
+            "unzip_workers": int(self.v_unzip_workers.get()),
+            "max_idx_workers": int(self.v_idx_workers.get()),
+            "max_snap_workers": int(self.v_snap_workers.get()),
+            "jvm_mb": int(self.v_jvm_mb.get()),
+            "gdal_path": self.v_gdal.get().strip(),
+            "output_crs": self.v_crs.get().strip(),
+        }
+
+    def _on_run_batch(self):
+        if self._running:
+            return
+        if not self._batch_aois:
+            messagebox.showerror("Batch", "Add at least one AOI file (section 1)."); return
+        for pth in self._batch_aois:
+            if not os.path.isfile(pth):
+                messagebox.showerror("Batch", f"AOI not found:\n{pth}"); return
+        out_base = self.v_batch_out.get().strip()
+        if not out_base:
+            messagebox.showerror("Batch", "Set an output base folder (section 3)."); return
+
+        mode = self.v_batch_mode.get()
+        if mode == "uniform":
+            jobs = [(a, self.v_batch_preset.get(), self.v_batch_speckle.get())
+                    for a in self._batch_aois]
+        elif mode == "all":
+            presets  = [k for k, v in self.v_batch_cp.items() if v.get()]
+            speckles = [k for k, v in self.v_batch_cs.items() if v.get()]
+            if not presets or not speckles:
+                messagebox.showerror("Batch", "Select at least one pipeline and one speckle."); return
+            jobs = [(a, p, s) for a in self._batch_aois for p in presets for s in speckles]
+        else:  # per_aoi
+            jobs = []
+            for a in self._batch_aois:
+                pv, sv = self._batch_per_aoi.get(a, (None, None))
+                if pv is None:
+                    messagebox.showerror("Batch", "Per-AOI table not built — reselect Per-AOI mode."); return
+                jobs.append((a, pv.get(), sv.get()))
+
+        if not messagebox.askyesno("Run batch",
+                f"Run {len(jobs)} job(s) across {len(self._batch_aois)} AOI(s)?\n\n"
+                f"Mode: {mode}\nOutput base: {out_base}\n\n"
+                "AOIs run sequentially — use STOP to halt after the current one."):
+            return
+
+        _save_config({"batch_out": out_base})
+
+        # begin run state (mirrors _on_start)
+        self._running = True
+        self._stopping = False
+        self._stop_event.clear()
+        self._force_event.clear()
+        with self._proc_lock:
+            self._cur_procs.clear()
+        self.btn_run.configure(state=tk.DISABLED, bg="#455A64")
+        self.btn_batch.configure(state=tk.DISABLED, bg="#455A64")
+        self.btn_stop.configure(state=tk.NORMAL, bg=RED)
+        self.progress.start(12)
+        self._reset_all_progress()
+        self._pipeline_start = time.time()
+        self._phase_starts = {}
+        self._tick_elapsed()
+
+        def _set_proc(pr):
+            with self._proc_lock:
+                if pr is not None:
+                    self._cur_procs.add(pr)
+                else:
+                    self._cur_procs = {q for q in self._cur_procs if q.poll() is None}
+
+        self._thread = threading.Thread(
+            target=self._batch_worker, args=(jobs, out_base, _set_proc), daemon=True)
+        self._thread.start()
+
+    def _batch_worker(self, jobs, out_base, set_proc):
+        ok_all = True
+        total = len(jobs)
+        for idx, (aoi, preset, speckle) in enumerate(jobs, 1):
+            if self._stop_event.is_set():
+                self._log(f"\n[Batch stopped — {idx-1}/{total} job(s) completed]")
+                break
+            label = f"{Path(aoi).stem} · {preset}" + ("" if speckle == "none" else f"/{speckle}")
+            self._log("\n" + "#" * 62)
+            self._log(f"# BATCH {idx}/{total}:  {label}")
+            self._log("#" * 62)
+            cfg = self._batch_cfg(aoi, preset, speckle, out_base)
+            cfg["stop_event"]  = self._stop_event
+            cfg["force_event"] = self._force_event
+            cfg["set_proc_cb"] = set_proc
+            for _d in (cfg["safe_dir"], cfg["snap_dir"], cfg["out_dir"]):
+                try: os.makedirs(_d, exist_ok=True)
+                except Exception: pass
+            _res = {"ok": False}
+            try:
+                run_pipeline(cfg, self._log,
+                             (lambda ok, r=_res: r.__setitem__("ok", ok)),
+                             self._update_progress)
+            except Exception as e:
+                self._log(f"[BATCH job error] {e}")
+            if not _res["ok"]:
+                ok_all = False
+            self.after(0, self._reset_all_progress)
+        self._on_done(ok_all)
+
     def _on_start(self, retry_dates=None):
         if self._running:
             return
@@ -5183,7 +5806,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             required_dirs.append(("SNAP GeoTIFF folder — step 2 output (section 10)", self.v_snap_dir))
         if self.v_do_indices.get():
             required_dirs.append(("COG indices folder — step 3 output (section 10)", self.v_out_dir))
-        if self.v_safe_source.get() in ("download", "cdse", "auto") and self.v_do_dl.get():
+        if self.v_safe_source.get() in ("download", "cdse", "cdse_s3", "auto") and self.v_do_dl.get():
             required_dirs.append(("Raw .SAFE folder — step 1 output (section 10)", self.v_safe_dir))
         for label, var in required_dirs:
             if not var.get().strip():
@@ -5273,6 +5896,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "fields_path":     (self.v_fields_path.get() or "").strip(),
             "retry_download":    self.v_retry_dl.get(),
             "max_dl_workers":    int(self.v_dl_workers.get()),
+            "s3_workers":        int(self.v_s3_workers.get()),
+            "satellites":        [s for s, v in self.v_sat.items() if v.get()] or ["S1A", "S1B", "S1C"],
             "unzip_workers":     int(self.v_unzip_workers.get()),
             "max_idx_workers":   int(self.v_idx_workers.get()),
             "max_snap_workers":  int(self.v_snap_workers.get()),
@@ -5285,6 +5910,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 "asf_token":      self.v_token.get(),
                 "cdse_user":      self.v_cdse_user.get(),
                 "cdse_pass":      self.v_cdse_pass.get(),
+                "s3_access":      self.v_s3_access.get(),
+                "s3_secret":      self.v_s3_secret.get(),
                 "remember_creds": True,
             })
 
@@ -5295,10 +5922,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "start_date":  self.v_start.get(),
             "end_date":    self.v_end.get(),
             "orbit_dir":   self.v_orbit.get(),
+            "satellites":  [s for s, v in self.v_sat.items() if v.get()] or ["S1A", "S1B", "S1C"],
             "asf_token":   self.v_token.get(),
-            "dl_source":   self.v_safe_source.get() if self.v_safe_source.get() in ("cdse", "auto") else "asf",
+            "dl_source":   self.v_safe_source.get() if self.v_safe_source.get() in ("cdse", "cdse_s3", "auto") else "asf",
             "cdse_user":   self.v_cdse_user.get(),
             "cdse_pass":   self.v_cdse_pass.get(),
+            "s3_access":   self.v_s3_access.get(),
+            "s3_secret":   self.v_s3_secret.get(),
             "do_download": False if (using_existing or using_existing_snap) else self.v_do_dl.get(),
             "do_snap":     False if using_existing_snap else self.v_do_snap.get(),
             "do_indices":  self.v_do_indices.get(),
@@ -5326,6 +5956,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "fields_path":     (self.v_fields_path.get() or "").strip(),
             "retry_download":    self.v_retry_dl.get(),
             "max_dl_workers":    int(self.v_dl_workers.get()),
+            "s3_workers":        int(self.v_s3_workers.get()),
             "unzip_workers":     int(self.v_unzip_workers.get()),
             "max_idx_workers":   int(self.v_idx_workers.get()),
             "max_snap_workers":  int(self.v_snap_workers.get()),
@@ -5459,6 +6090,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._running = True
         self._stopping = False
         self._stop_event.clear()
+        self._force_event.clear()
         with self._proc_lock:
             self._cur_procs.clear()
         self.btn_run.configure(state=tk.DISABLED, bg="#455A64")
@@ -5469,6 +6101,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._phase_starts   = {}
         self._tick_elapsed()          # start the live 1-second elapsed ticker
         cfg["stop_event"] = self._stop_event
+        cfg["force_event"] = self._force_event
         self._last_cfg = cfg.copy()
         def _set_proc(p):
             with self._proc_lock:
@@ -5540,6 +6173,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._running = False
         self._stopping = False
         self._stop_event.set()
+        self._force_event.set()   # also abort any in-flight CDSE download mid-scene
         # Kill ALL running SNAP/GPT subprocesses (covers parallel workers)
         with self._proc_lock:
             _procs = [q for q in self._cur_procs if q.poll() is None]
@@ -5549,6 +6183,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         # Reset UI so user can re-run
         def _reset():
             self.btn_run.configure(state=tk.NORMAL, bg=ACCENT)
+            if hasattr(self, "btn_batch"):
+                self.btn_batch.configure(state=tk.NORMAL, bg=ACCENT)
             self.btn_stop.configure(state=tk.DISABLED, bg="#455A64")
             self.progress.stop()
         self.after(0, _reset)
@@ -5558,6 +6194,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             self._running = False
             self._stopping = False
             self.btn_run.configure(state=tk.NORMAL, bg=ACCENT)
+            if hasattr(self, "btn_batch"):
+                self.btn_batch.configure(state=tk.NORMAL, bg=ACCENT)
             self.btn_stop.configure(state=tk.DISABLED, bg="#455A64")
             self.progress.stop()
             # show final elapsed; clear ETA
