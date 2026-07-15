@@ -104,7 +104,7 @@ Optional dB copies (suffix `_dB`) can be enabled in section 9 of the GUI — for
 | ⬇ Download | 3 | Area of Interest — `.shp`, `.gpkg`, `.geojson`, or draw on interactive map |
 | ⬇ Download | 4 | Date Range — with optional calendar picker |
 | ⬇ Download | 5 | Orbit Direction — ASC, DSC, or Both |
-| ⬇ Download | 5b | Satellites — pick S1A / S1B / S1C (e.g. S1C-only to backfill; ASF has no S1C) |
+| ⬇ Download | 5b | Satellites — pick S1A / S1B / S1C (e.g. S1C-only to backfill; all sources incl. ASF now serve S1C — see below) |
 | ⬇ Download | 6 | ASF Credentials — NASA Earthdata token or username/password |
 | ⬇ Download | 6b | Copernicus CDSE Credentials — refresh/offline token only for CDSE download |
 | ⬇ Download | **6c** | **CDSE S3 Keys — fastest download, direct from object store (no unzip)** |
