@@ -100,14 +100,14 @@ Optional dB copies (suffix `_dB`) can be enabled in section 9 of the GUI — for
 
 | Tab | Section | Description |
 |-----|---------|-------------|
-| ⬇ Download | 1 | Sentinel-1 Source — download from CDSE S3 (fastest), ASF, Copernicus CDSE, or use existing `.SAFE` folder |
+| ⬇ Download | 1 | Sentinel-1 Source — download from CDSE S3, ASF, Copernicus CDSE, or use existing `.SAFE` folder |
 | ⬇ Download | 3 | Area of Interest — `.shp`, `.gpkg`, `.geojson`, or draw on interactive map |
 | ⬇ Download | 4 | Date Range — with optional calendar picker |
 | ⬇ Download | 5 | Orbit Direction — ASC, DSC, or Both |
 | ⬇ Download | 5b | Satellites — pick S1A / S1B / S1C (e.g. S1C-only to backfill; all sources incl. ASF now serve S1C — see below) |
 | ⬇ Download | 6 | ASF Credentials — NASA Earthdata token or username/password |
 | ⬇ Download | 6b | Copernicus CDSE Credentials — refresh/offline token only for CDSE download |
-| ⬇ Download | **6c** | **CDSE S3 Keys — fastest download, direct from object store (no unzip)** |
+| ⬇ Download | **6c** | **CDSE S3 Keys — direct from object store (no unzip)** |
 | ⬇ Download | **7** | **Parallel Downloads — 1–5 scenes simultaneously with real-time Mbps display** |
 | ⚙ Processing | 2 | Preprocessing Graph — σ⁰ Standard, γ⁰ RTC, or custom XML |
 | ⚙ Processing | 2b | Speckle Filter — Lee Sigma, Gamma Map, or fully configurable custom |
@@ -192,7 +192,7 @@ The simplest reliable starting point is to copy one of the built-in graphs in `s
 
 ### Downloads (sections 1, 6c, 7)
 
-There are three download sources. **CDSE S3 is the fastest** and needs no unzip step.
+There are three download sources. **CDSE S3 needs no unzip step** and should be the fastest, but a connection-pool starvation bug currently caps it below ASF (see benchmark below), so **ASF is the fastest reliable source today**.
 
 | Source | Parallel support | Notes |
 |--------|-----------------|-------|
@@ -204,12 +204,14 @@ There are three download sources. **CDSE S3 is the fastest** and needs no unzip 
 
 | Method | Throughput | ~1 GB scene |
 |--------|-----------|-------------|
-| **CDSE S3** (16 parallel files) | **112 Mbit/s** (near the 160 Mbit/s cap) | ~70 s |
 | ASF (1 connection) | 48–67 Mbit/s | ~2–3 min |
 | CDSE OData, 3 parallel workers | 21 Mbit/s (throttled) | ~6 min |
 | CDSE OData, 1 connection (throttled) | 7 Mbit/s | ~19 min |
+| CDSE S3 (parallel files) | currently slower than ASF — connection-pool starvation, fix pending | — |
 
-To go faster still, generate multiple S3 keys (each has its own 20 MB/s cap). Get keys at the [CDSE S3 keys manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/).
+> **Note:** CDSE S3 *should* lead this table — it bypasses the OData throttle and skips unzip — but a connection-pool starvation bug is currently holding it below ASF, and the earlier 112 Mbit/s figure was not reproducible. Until the fix lands, **ASF is the fastest reliable source**.
+
+Once the S3 bug is fixed, you can go faster still by generating multiple S3 keys (each has its own 20 MB/s cap). Get keys at the [CDSE S3 keys manager](https://eodata-s3keysmanager.dataspace.copernicus.eu/).
 
 The **parallel downloads** spinner (section 7) applies to **CDSE OData and CDSE S3** (2–5 scenes at once; ASF ignores values > 1). For CDSE S3 it stacks with the **"Parallel files / scene"** control (section 6c, 1–16, default 8): a single S3 scene rarely saturates the 20 MB/s per-key cap, so running 3–5 scenes at once fills it.
 
@@ -217,7 +219,7 @@ The **parallel downloads** spinner (section 7) applies to **CDSE OData and CDSE 
 
 Pick which satellites to fetch (S1A / S1B / S1C). Notes:
 
-- **All sources return Sentinel-1C.** S1C became available in April 2025; ASF exposes it via `asf_search` **≥ 8.1.3** (this app now requires that — older 6.x could not see S1C), and CDSE / CDSE S3 have it too. In a like-for-like 4-month 2025 test, CDSE returned marginally more S1C than ASF (54 vs 46) and is faster, so **CDSE / CDSE S3 is the best choice for S1C**, but ASF works.
+- **All sources return Sentinel-1C.** S1C became available in April 2025; ASF exposes it via `asf_search` **≥ 8.1.3** (this app now requires that — older 6.x could not see S1C), and CDSE / CDSE S3 have it too. In a like-for-like 4-month 2025 test, CDSE returned marginally more S1C than ASF (54 vs 46), so **CDSE / CDSE S3 is a good choice for S1C**, but ASF works.
 - Same dual-pol VV+VH, same footprints — S1C simply adds revisit density.
 
 > **⚠ Recent data — prefer CDSE.** ASF is a *mirror* of ESA's archive, so the newest scenes (roughly the last few days) can be missing from ASF until it catches up, and ASF only began ingesting Sentinel-1C on **30 April 2025** without backfilling the earliest S1C acquisitions. In a like-for-like 4-month 2025 test ASF returned a strict *subset* of CDSE (46 S1C vs 54) — the 8 it lacked were the earliest S1C scenes plus the single most-recent one. **If your date range includes very recent dates (or early-2025 S1C), use CDSE or CDSE S3** to be sure you get everything; ASF may silently return fewer scenes.
@@ -573,7 +575,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*
-- ~~**CDSE S3 direct download (S1)**~~ *(done — Download tab, section 6c; fastest source, bypasses the OData throttle and skips unzip; ~112 Mbit/s measured vs 7–67 for the other sources — see Downloads section)*
+- ~~**CDSE S3 direct download (S1)**~~ *(done — Download tab, section 6c; bypasses the OData throttle and skips unzip. Currently slower than ASF due to a connection-pool starvation bug (fix pending); see Downloads section.)*
 - ~~**Raster Calculator (S1 & S2)**~~ *(done — 🧮 Raster Calc tab in both UIs)*
 - ~~**Custom Bands (S1)**~~ *(done — Processing tab, numpy expressions with VV/VH/CR/RVI/DIFF)*
 - ~~**Custom Indices (S2)**~~ *(done — Processing tab, numpy expressions with B2–B12)*
