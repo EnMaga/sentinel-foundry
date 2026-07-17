@@ -312,6 +312,17 @@ For large jobs whose full set of `.SAFE` products won't fit on the working drive
 
 ---
 
+### Removable-drive resilience
+
+A run often spans several drives — downloads on one, `.SAFE` extraction on another, SNAP tiles and final COGs on others — and external drives sometimes drop out mid-run. The pipeline waits for **every** drive it reads or writes to reconnect, rather than failing:
+
+- At the **start of a run and before each batch**, it verifies the download, extraction, SNAP and output drives are all writable. If any has dropped, it **pauses and re-checks every 2 minutes** (`⏸ … waiting for X: to reconnect`) until the drive returns (`▶ … back — resuming`), or you press Stop.
+- If a drive stumbles **mid-extraction**, the affected `.zip` is **kept, never deleted** — a transient drive/IO fault is not treated as corruption (genuine corruption is still caught and removed by the pre/post integrity checks), so the scene is retried instead of lost.
+
+This lets an unattended multi-drive run survive a drive that drops and comes back.
+
+---
+
 ### Multiple-AOI batch runner
 
 The **Batch** tab processes **many AOIs in one sequential run** — each AOI (and each pipeline variant) gets its own auto-named output folder, and AOIs run one after another.

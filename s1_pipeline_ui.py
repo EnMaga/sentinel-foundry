@@ -515,6 +515,11 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             log("  ⚠ CDSE S3 delivers .SAFE directly — '.SAFE unzip folder' ignored "
                 "(using the download folder).")
             safe_out = safe_dir
+        # Wait for every drive this run reads/writes (download, extract, SNAP,
+        # finals) to be online before touching them — an external drive may be
+        # reconnecting; don't fail makedirs on a transient drop.
+        if not _ensure_drives([safe_dir, safe_out, snap_dir, out_dir], log, cfg.get("stop_event")):
+            done_cb(False); return
         os.makedirs(safe_dir,  exist_ok=True)
         os.makedirs(snap_dir,  exist_ok=True)
         os.makedirs(out_dir,   exist_ok=True)
@@ -1970,6 +1975,25 @@ def _wait_for_drive(path, log, stop_ev=None, poll=120):
     return False
 
 
+def _ensure_drives(paths, log, stop_ev=None):
+    """Wait until EVERY given path's drive is writable again (reconnect if any
+    dropped), so an unattended run survives any read/write drive dropping out —
+    not just the SNAP output drive. Returns False if the user stopped while
+    waiting, True once all are available. Blank/None paths are skipped, and
+    duplicates on the same volume are only probed once."""
+    seen = set()
+    for p in paths:
+        if not p:
+            continue
+        vol = os.path.splitdrive(os.path.abspath(p))[0].lower() or os.path.abspath(p)
+        if vol in seen:
+            continue
+        seen.add(vol)
+        if not _wait_for_drive(p, log, stop_ev):
+            return False
+    return True
+
+
 def _locate_safe_root(root):
     """Find the Sentinel product directory inside `root` regardless of naming:
     the folder that directly contains manifest.safe (or a *.SAFE subdir).
@@ -2134,6 +2158,12 @@ def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progr
     for i, chunk in enumerate(chunks, 1):
         if stop_ev and stop_ev.is_set():
             log(f"  [Stopped at batch boundary — halted before batch {i}/{_total}]"); return
+        # Before each batch, make sure EVERY drive this batch touches is online —
+        # zips (safe_dir), extraction (safe_out), SNAP (snap_dir), finals (out_dir).
+        # If any external drive dropped out, wait for it to reconnect rather than
+        # failing scenes (returns False only if the user stops while waiting).
+        if not _ensure_drives([safe_dir, safe_out, snap_dir, cfg.get("out_dir")], log, stop_ev):
+            return
         _cgb = sum(os.path.getsize(z) for z in chunk if os.path.isfile(z)) * _EST / (1024**3)
         log(f"\n── Batch {i}/{_total}: {len(chunk)} scene(s), ~{_cgb:.0f} GB .SAFE ──")
         _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=chunk)
@@ -2289,15 +2319,16 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
             import traceback as _tb
             log(f"    ERROR: could not unzip {Path(zp).name}: {e}")
             _write_error(cfg, stem, "unzip", _tb.format_exc())
-            if _extracted_ok:
-                # Extraction succeeded; only the move/rename failed (transient
-                # lock, dest busy). The zip is fine — KEEP it so the next run
-                # retries instead of silently dropping this date.
-                log(f"    Kept zip for retry (extraction OK, placement failed): {Path(zp).name}")
-                _tick(f"{stem[:28]}  ✗ move-failed (zip kept)"); return
-            try: os.remove(zp); log(f"    Deleted corrupted zip: {Path(zp).name}")
-            except Exception: pass
-            _tick(f"{stem[:28]}  ✗ error"); return
+            # NEVER delete the zip here. A generic extract/move failure is almost
+            # always a drive/IO fault (a flaky external drive dropping out mid-op),
+            # not corruption — and genuine corruption is already caught and deleted
+            # by the pre-unzip and post-unzip integrity checks. So: wait for any
+            # dropped drive to reconnect, keep the zip, and let it be retried
+            # rather than silently dropping the date.
+            _ensure_drives([safe_dir, _safe_out], log, stop_ev)
+            _why = "move-failed" if _extracted_ok else "extract-failed"
+            log(f"    Kept zip for retry ({_why}): {Path(zp).name}")
+            _tick(f"{stem[:28]}  ✗ {_why} (zip kept)"); return
         finally:
             # always delete the half-extracted temp and any partial cross-volume
             # move staging, so Stop never leaves a half-unzipped product behind.
