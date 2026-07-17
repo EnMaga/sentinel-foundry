@@ -300,9 +300,21 @@ When your AOI spans two or more adjacent Sentinel-1 frames, tiles are processed 
 
 ---
 
+### Batch disk budget & incremental output
+
+For large jobs whose full set of `.SAFE` products won't fit on the working drive, set a **batch disk budget** (`safe_scratch_gb`, section 2e) — a number of GB (e.g. `15`) or `auto` (80 % of the target drive's free space). The pipeline then works in **chunks**: extract ≤ budget GB of `.SAFE` → SNAP → compute COG indices → delete that chunk's `.SAFE` → next chunk, so no more than one budget's worth of `.SAFE` is ever on disk at once. Leave it blank / `0` to extract everything at once (old behaviour).
+
+- **Separate / faster `.SAFE` drive** — set `safe_out_dir` to extract onto a fast internal drive (e.g. an NVMe `C:`) even when the zips download to a slower or external one. Exploding a `.SAFE`'s thousands of small files is IOPS-bound and far faster on a healthy internal disk; the budget is measured against this drive's free space.
+- **Incremental finals** — in batch mode the COG indices are produced **per chunk**, not only at the end, so outputs appear as the run progresses and each chunk's SNAP GeoTIFFs are freed as they're consumed. The step-3 pass scans the whole SNAP folder, so GeoTIFFs left over from an interrupted earlier run are finalized too.
+- **Resume-safe delete** — a chunk's `.SAFE` is removed only once a COG (or `.done` marker) for its date + orbit exists; a stopped or failed conversion keeps its `.SAFE` for the next run instead of silently dropping that date.
+- **Progress / ETA** — after each batch the log prints elapsed + estimated time remaining, e.g. `est. 3h 18m left (13 batches to go)`.
+- **Auto-sized parallel SNAP** — the default number of parallel SNAP jobs is chosen from *available* RAM (each JVM heap is large), leaving headroom for the OS and other apps so the machine doesn't page. Override it in section 2e.
+
+---
+
 ### Stop button
 
-Pressing **■ STOP** immediately kills the running SNAP GPT subprocess (`Popen.kill()`), cancels pending downloads, and halts the pipeline. The UI resets to ready state.
+Pressing **■ STOP** once is **graceful**: it stops launching new scenes — and, in batch mode, new batches — but lets the SNAP run(s) already in flight finish and publish, so you never lose minutes of compute or leave a half-done group. Scenes that finished are still turned into COG indices and their raw `.SAFE` cleaned; scenes not yet converted keep their `.SAFE` so a re-run resumes them. **Press STOP a second time to force-kill** the running SNAP GPT subprocess(es) (`Popen.kill()`) and abort any in-flight download immediately. The UI resets to ready state.
 
 **Closing the window while processing:** if you click the window's ✕ (close) button while a run is still in progress, both SAR Foundry and Optical Foundry now ask *"The pipeline is still running — are you sure you want to quit?"* (default **No**). Confirming stops the run first (killing SNAP subprocesses on SAR / cancelling pending days on Optical) and then closes; declining leaves the window open. Closing while idle exits with no prompt.
 
@@ -572,6 +584,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 
 - **One-click builds** — Windows, macOS and Linux builds are on the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases) (macOS/Linux not yet field-tested — feedback welcome). Python, SNAP and GDAL remain external prerequisites.
 - ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
+- ~~**Batch disk budget + incremental per-batch output (S1)**~~ *(done — section 2e; extract → SNAP → index → delete per chunk, COG indices produced per batch, resume-safe `.SAFE` delete, elapsed/ETA per batch, RAM-aware SNAP-worker default; see "Batch disk budget & incremental output")*
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*

@@ -305,11 +305,24 @@ def _get_total_ram_gb():
 
 
 def _safe_snap_workers(jvm_mb):
-    """Return a safe default number of parallel SNAP jobs for this machine."""
-    total_gb  = _get_total_ram_gb()
-    usable_gb = max(0, total_gb - 4)   # leave 4 GB for OS + other processes
-    jvm_gb    = jvm_mb / 1024
-    return max(1, min(4, int(usable_gb / jvm_gb)))
+    """Return a safe default number of parallel SNAP jobs for this machine.
+
+    Each worker is a full JVM (jvm_mb) PLUS gdal children and, in the per-batch
+    pipeline, a concurrent indexing pass — so 'JVM nominally fits in total RAM'
+    oversubscribes and pushes the machine into paging (measured: 2×10 GB JVM on a
+    32 GB laptop with a browser open → 98% commit, <1 GB free, SNAP thrashing).
+    Size off *currently available* RAM (which already excludes other running
+    apps) minus a headroom buffer for OS cache + gdal + indexing.
+    ponytail: 6 GB buffer + total*0.6 fallback are heuristics; raise the buffer
+    if paging still shows up on a given box."""
+    jvm_gb = max(1.0, jvm_mb / 1024.0)
+    buffer_gb = 6.0                      # OS cache + gdal + per-batch indexing
+    try:
+        import psutil
+        budget = psutil.virtual_memory().available / 1024 ** 3
+    except Exception:
+        budget = _get_total_ram_gb() * 0.6   # no psutil → assume ~40% already used
+    return max(1, min(4, int((budget - buffer_gb) / jvm_gb)))
 
 
 # Default graph: look next to the script file (works on any machine with same folder layout)
@@ -325,6 +338,12 @@ else:
     DEFAULT_GPT = os.path.expanduser("~/snap/bin/gpt")
 
 ALL_BANDS = ["VV", "VH", "CR", "RVI", "DIFF"]
+
+# Pretty pipeline labels for the Batch tab. Internal keys stay sigma0/gamma0
+# (folder names, graph selection); only the UI text changes.
+# σ⁰ = Filipponi (2019 GRD workflow); γ⁰ = Small (2011 gamma-flattening RTC).
+PRESET_LABELS = {"sigma0": "σ⁰ (Filipponi)", "gamma0": "γ⁰ (Small)"}
+PRESET_KEYS   = {v: k for k, v in PRESET_LABELS.items()}
 
 _CONFIG_FILE = os.path.join(_SCRIPT_DIR, "sar_foundry_config.json")
 
@@ -489,14 +508,33 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         safe_dir   = cfg["safe_dir"]
         snap_dir   = cfg["snap_dir"]
         out_dir    = cfg["out_dir"]
+        # Optional separate .SAFE output dir (e.g. a faster/healthier drive). Zips are
+        # still read from — and deleted in — safe_dir; blank → .SAFE stay in safe_dir.
+        safe_out   = (cfg.get("safe_out_dir") or "").strip() or safe_dir
+        if safe_out != safe_dir and cfg.get("dl_source") == "cdse_s3":
+            log("  ⚠ CDSE S3 delivers .SAFE directly — '.SAFE unzip folder' ignored "
+                "(using the download folder).")
+            safe_out = safe_dir
         os.makedirs(safe_dir,  exist_ok=True)
         os.makedirs(snap_dir,  exist_ok=True)
         os.makedirs(out_dir,   exist_ok=True)
+        os.makedirs(safe_out,  exist_ok=True)
+        if safe_out != safe_dir:
+            log(f"  .SAFE output → {safe_out}   (zips read from {safe_dir})")
+
+        # Optional batching: cap how much .SAFE sits on disk at once by processing in
+        # chunks (extract → SNAP → delete, repeat) so a small/slow output drive never
+        # fills. Needs SNAP enabled (nothing consumes/frees .SAFE otherwise).
+        _batch_gb = _resolve_batch_gb(cfg, safe_out)
+        _batching = _batch_gb > 0 and cfg.get("do_snap")
+        if _batching:
+            cfg["_batch_defer"] = True   # keep the download path from unzipping; we chunk below
+            log(f"  Batch mode ON: ≤ {_batch_gb:g} GB of .SAFE at a time (extract → SNAP → delete per chunk).")
 
         # ── step 1: download ─────────────────────────────────────────────
         # Broken/empty .SAFE products (interrupted download or extraction) are
         # removed first — they fail SNAP and block re-download/unzip otherwise.
-        _broken_safes = _prune_broken_safes(safe_dir, log)
+        _broken_safes = _prune_broken_safes(safe_out, log)
         failed_downloads = []
         if cfg["do_download"]:
             failed_downloads = _download_dispatch(cfg, safe_dir, log, progress_cb)
@@ -509,9 +547,12 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
                 log(f"  {len(_broken_safes)} broken/incomplete .SAFE found — "
                     f"attempting re-download…")
                 _redownload_missing(cfg, safe_dir, _broken_safes, log, progress_cb)
-            # Still unzip any .zip files present — they won't be found by SNAP otherwise
+            # Still unzip any .zip files present — they won't be found by SNAP otherwise.
+            # Batch mode does its own chunked extract in step 2, so skip the bulk unzip here.
             _zips = glob.glob(os.path.join(safe_dir, "*.zip"))
-            if _zips:
+            if _batching and _zips:
+                log(f"  Found {len(_zips)} .zip archive(s) — will extract in batches (step 2).")
+            elif _zips:
                 log(f"  Found {len(_zips)} .zip archive(s) in folder — extracting before SNAP…")
                 _unzip_zips(safe_dir, log, progress_cb, _stop_ev, cfg)
             else:
@@ -523,16 +564,21 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             done_cb(False); return
 
         # ── step 2: SNAP processing ───────────────────────────────────────
-        if cfg["do_snap"]:
+        if _batching:
+            cfg.pop("_batch_defer", None)
+            log("\n── STEP 1b+2: Batched  extract → SNAP → delete .SAFE  (per chunk) ──")
+            _process_in_batches(cfg, safe_dir, safe_out, snap_dir, _batch_gb,
+                                 log, progress_cb, cfg.get("stop_event"))
+        elif cfg["do_snap"]:
             log("\n── STEP 2: SNAP GPT preprocessing ──")
-            _snap_process(cfg, safe_dir, snap_dir, log, progress_cb)
+            _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
         else:
             log("\n── STEP 2: Skipped ──")
 
-        # ── cleanup .SAFE source dirs (optional) ──────────────────────────
-        if cfg.get("clean_safe") and cfg["do_snap"]:
-            log("\n── Deleting .SAFE source files ──")
-            _clean_safe(safe_dir, log)
+        # ── cleanup .SAFE source dirs (optional; batch mode already deletes per chunk) ──
+        if not _batching and cfg.get("clean_safe") and cfg["do_snap"]:
+            log("\n── Deleting .SAFE source files (only those converted to GeoTIFF) ──")
+            _clean_safe(safe_out, log, snap_dir, cfg)
 
         # ── stop check ───────────────────────────────────────────────────
         if cfg.get("stop_event") and cfg["stop_event"].is_set():
@@ -868,7 +914,7 @@ def _download(cfg, safe_dir, log, progress_cb=None):
             name      = scene.properties.get("sceneName", "")
             date      = scene.properties.get("startTime", "")[:10]
             dirn      = scene.properties.get("flightDirection", "?")[:3].upper()
-            safe_path = os.path.join(safe_dir, name + ".SAFE")
+            safe_path = os.path.join((cfg.get("safe_out_dir") or "").strip() or safe_dir, name + ".SAFE")
             zip_path  = os.path.join(safe_dir, name + ".zip")
 
             # skip if already extracted or zip already present
@@ -1138,7 +1184,7 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
         # scene already fetched from either source is recognised — and skipped —
         # by the other, and unzip yields <product>.SAFE, not <product>.SAFE.SAFE.
         base      = name[:-5] if name.endswith(".SAFE") else name
-        safe_path = os.path.join(safe_dir, base + ".SAFE")
+        safe_path = os.path.join((cfg.get("safe_out_dir") or "").strip() or safe_dir, base + ".SAFE")
         zip_path  = os.path.join(safe_dir, base + ".zip")
 
         if os.path.isdir(safe_path) or os.path.isfile(zip_path):
@@ -1719,44 +1765,151 @@ def _find_fast_extractor():
               r"C:\Program Files (x86)\7-Zip\7z.exe"):
         if os.path.isfile(p):
             _FAST_EXTRACTOR = ("7z", p); return _FAST_EXTRACTOR
-    # Windows 10+ and macOS ship libarchive `tar` (bsdtar), which reads .zip.
-    # GNU tar (typical on Linux) cannot, so restrict to those platforms.
-    tp = shutil.which("tar")
-    if tp and (os.name == "nt" or sys.platform == "darwin"):
-        _FAST_EXTRACTOR = ("tar", tp); return _FAST_EXTRACTOR
+    # bsdtar (libarchive) reads .zip; GNU tar does NOT. shutil.which may resolve
+    # GNU tar first (e.g. Git's on Windows), so probe candidates and keep the
+    # first that actually reports bsdtar/libarchive — a platform check alone
+    # would wrongly accept Git's GNU tar and then silently fall back to zipfile.
+    _tar_cands = [shutil.which("tar")]
+    if os.name == "nt":
+        _tar_cands.append(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                       "System32", "tar.exe"))
+    for tp in _tar_cands:
+        if not tp or not os.path.isfile(tp):
+            continue
+        try:
+            v = subprocess.run([tp, "--version"], capture_output=True, text=True, timeout=5)
+            if any(k in (v.stdout + v.stderr).lower() for k in ("bsdtar", "libarchive")):
+                _FAST_EXTRACTOR = ("tar", tp); return _FAST_EXTRACTOR
+        except Exception:
+            pass
     _FAST_EXTRACTOR = ("zipfile", None)
     return _FAST_EXTRACTOR
 
 
-def _extract_archive(zp, dest, log):
+class _ExtractStopped(Exception):
+    """Raised when extraction was aborted because the user hit Stop, so callers
+    can clean up the half-extracted product instead of treating it as an error."""
+
+
+def _run_extractor(cmd, stop_ev):
+    """Run an extractor subprocess, but poll `stop_ev` while it works so Stop
+    actually kills the in-flight 7z/tar (subprocess.run would block until it
+    finished on its own — that's why closing the app left extractions running).
+    Returns (rc, out, err); rc is None when killed by Stop."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True)
+    while True:
+        try:
+            out, err = p.communicate(timeout=0.5)
+            return p.returncode, out, err
+        except subprocess.TimeoutExpired:
+            if stop_ev and stop_ev.is_set():
+                p.kill()
+                try: out, err = p.communicate(timeout=5)
+                except Exception: out, err = "", ""
+                return None, out, err
+
+
+def _extract_archive(zp, dest, log, stop_ev=None):
     """Extract zip `zp` into directory `dest`, using the fastest available tool
-    and falling back to Python zipfile on any failure. Raises on total failure."""
+    and falling back to Python zipfile on any failure. Raises on total failure,
+    or _ExtractStopped if the user hit Stop mid-extraction."""
     import zipfile
     kind, exe = _find_fast_extractor()
 
-    def _emsg(r):
+    def _emsg(out, err):
         # 7-Zip prints errors on stdout, not stderr; include both.
-        return ((r.stdout or "") + " " + (r.stderr or "")).strip().replace("\n", " ")[:200]
+        return ((out or "") + " " + (err or "")).strip().replace("\n", " ")[:200]
 
     try:
         if kind == "7z":
             # -bd: no progress line; put the archive right after `x` so 7-Zip
             # never mistakes a later path for a switch (that caused rc=2).
-            r = subprocess.run([exe, "x", zp, "-y", "-bd", "-o" + dest],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if r.returncode == 0:
+            rc, out, err = _run_extractor([exe, "x", zp, "-y", "-bd", "-o" + dest],
+                                          stop_ev)
+            if rc is None: raise _ExtractStopped()
+            if rc == 0:
                 return
-            log(f"    (7z rc={r.returncode}: {_emsg(r)} — falling back to zipfile)")
+            log(f"    (7z rc={rc}: {_emsg(out, err)} — falling back to zipfile)")
         elif kind == "tar":
-            r = subprocess.run([exe, "-xf", zp, "-C", dest],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if r.returncode == 0:
+            rc, out, err = _run_extractor([exe, "-xf", zp, "-C", dest], stop_ev)
+            if rc is None: raise _ExtractStopped()
+            if rc == 0:
                 return
-            log(f"    (tar rc={r.returncode}: {_emsg(r)} — falling back to zipfile)")
+            log(f"    (tar rc={rc}: {_emsg(out, err)} — falling back to zipfile)")
+    except _ExtractStopped:
+        raise
     except Exception as e:
         log(f"    (fast extractor error: {e} — falling back to zipfile)")
+    if stop_ev and stop_ev.is_set():
+        raise _ExtractStopped()
     with zipfile.ZipFile(zp, 'r') as z:
         z.extractall(_long_path(dest))
+
+
+def _same_volume(a, b):
+    return (os.path.splitdrive(os.path.abspath(a))[0].lower()
+            == os.path.splitdrive(os.path.abspath(b))[0].lower())
+
+
+def _unzip_stage_root(cfg, safe_dir):
+    """Where to extract archives before moving them into `safe_dir`. Exploding the
+    thousands of tiny files in a .SAFE straight onto a slow/external drive is
+    latency-bound (small-file IOPS + the zip read fighting the writes on one USB
+    bus). Extracting on a fast local scratch (internal NVMe) and then bulk-moving
+    the finished product is markedly faster. cfg["unzip_stage_dir"]: "auto" (system
+    temp), "off"/"" (extract in place), or an explicit dir. Returns a scratch dir
+    on a *different* volume than safe_dir, or safe_dir itself when off / same volume
+    (staging to the same drive would just be a pointless extra copy)."""
+    val = str(cfg.get("unzip_stage_dir", "auto")).strip()
+    if not val or val.lower() == "off":
+        return safe_dir
+    root = tempfile.gettempdir() if val.lower() == "auto" else val
+    try:
+        if _same_volume(root, safe_dir):
+            return safe_dir
+        stage = os.path.join(root, "sentinel_unzip_stage")
+        os.makedirs(stage, exist_ok=True)
+        return stage
+    except Exception:
+        return safe_dir
+
+
+# Only one cross-volume move runs at a time. With >1 unzip worker, extractions
+# proceed in parallel on the fast scratch volume, but two robocopies to the same
+# (often slow/external) output drive just thrash one head and throttle each other
+# — serialising the moves lets each product write sequentially at the drive's
+# real speed while the next scene extracts ahead.
+# ponytail: single global lock; if two output drives are ever in play, key the
+# lock by destination volume instead.
+_MOVE_LOCK = threading.Lock()
+
+
+def _move_tree_cross_volume(src, dst_final, dst_dir, stem, log):
+    """Move extracted product dir `src` (on a fast scratch volume) to `dst_final`
+    on another volume. On Windows, thousands of small .SAFE files copy far faster
+    with multithreaded robocopy than a single-threaded shutil.move; copy into a
+    staging dir on the destination volume, then an atomic same-volume rename so
+    SNAP never sees a half-copied .SAFE. Falls back to shutil.move otherwise.
+    Serialised via _MOVE_LOCK so concurrent unzip workers don't thrash one drive."""
+    with _MOVE_LOCK:
+        if os.name == "nt":
+            mv = os.path.join(dst_dir, f".__mv_{stem}")
+            try:
+                if os.path.isdir(mv):
+                    _rmtree(mv)
+                r = subprocess.run(
+                    ["robocopy", src, mv, "/E", "/MT:4", "/R:2", "/W:2",
+                     "/NFL", "/NDL", "/NP", "/NJH", "/NJS"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if r.returncode < 8:                 # robocopy: rc 0-7 = success
+                    os.replace(mv, dst_final)        # same volume → instant rename
+                    return
+                log(f"    (robocopy rc={r.returncode} — falling back to shutil.move)")
+            except Exception as e:
+                log(f"    (robocopy error: {e} — falling back to shutil.move)")
+            _rmtree(mv)
+        shutil.move(src, dst_final)
 
 
 def _long_path(p):
@@ -1767,6 +1920,13 @@ def _long_path(p):
         return p
     ap = os.path.abspath(p)
     return ap if ap.startswith("\\\\?\\") else "\\\\?\\" + ap
+
+
+def _rmtree(p):
+    # rmtree that survives Windows MAX_PATH on deep Sentinel .SAFE trees — a plain
+    # shutil.rmtree(ignore_errors=True) silently fails on >260-char paths, which
+    # would leave multi-GB half-extracted products on the scratch/output drive.
+    shutil.rmtree(_long_path(p), ignore_errors=True)
 
 
 def _is_drive_gone(e):
@@ -1912,12 +2072,109 @@ def _redownload_missing(cfg, safe_dir, removed_names, log, progress_cb):
     try:
         _download_dispatch(tmp, safe_dir, log, progress_cb)
         _unzip_zips(safe_dir, log, progress_cb, cfg.get("stop_event"), cfg)
-        _normalize_safe_dirs(safe_dir, log)
+        _normalize_safe_dirs((cfg.get("safe_out_dir") or "").strip() or safe_dir, log)
     except Exception as _de:
         log(f"  ⚠ Re-download failed: {_de} — scene(s) will be missing.")
 
 
-def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
+def _resolve_batch_gb(cfg, safe_out):
+    """Parse cfg['safe_scratch_gb'] → GB budget for .SAFE held on disk at once.
+    '' / 0 / 'off' → 0.0 (disabled: extract everything at once, old behaviour);
+    'auto' → 80% of the .SAFE drive's current free space; a number → that many GB."""
+    v = str(cfg.get("safe_scratch_gb", "")).strip().lower()
+    if not v or v in ("0", "off", "none"):
+        return 0.0
+    if v == "auto":
+        try:
+            return max(5.0, (shutil.disk_usage(safe_out).free * 0.8) / (1024**3))
+        except Exception:
+            return 0.0
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        return 0.0
+
+
+def _fmt_dur(sec):
+    """Human duration: '42.0 min' under an hour, '2h 15m' at or above."""
+    m = sec / 60.0
+    return f"{m:.1f} min" if m < 60 else f"{int(m // 60)}h {int(round(m % 60))}m"
+
+
+def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_cb, stop_ev):
+    """Extract → SNAP → delete .SAFE in chunks so no more than ~budget_gb of .SAFE
+    exist at once — keeps a small/slow output drive from filling. .SAFE ≈ 1.7× its
+    zip (measured on GRDH). Each chunk's .SAFE is deleted after SNAP, before the next."""
+    _EST = 1.7
+    zips = sorted(glob.glob(os.path.join(safe_dir, "*.zip")))
+    if not zips:
+        log("  No .zip to batch — running SNAP over any existing .SAFE.")
+        if cfg.get("do_snap"):
+            _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
+        return
+    budget = budget_gb * (1024**3)
+    chunks, cur, cursz = [], [], 0.0
+    for zp in zips:
+        try:
+            s = os.path.getsize(zp) * _EST
+        except OSError:
+            s = 0
+        if cur and cursz + s > budget:
+            chunks.append(cur); cur, cursz = [], 0.0
+        cur.append(zp); cursz += s
+    if cur:
+        chunks.append(cur)
+    log(f"  Batch mode: {len(zips)} scene(s) → {len(chunks)} chunk(s) of "
+        f"≤ {budget_gb:g} GB .SAFE, output {safe_out}")
+    _total = len(chunks)
+    _t0 = time.time()
+    # Stop is checked only at batch boundaries (top + end of each iteration): a
+    # batch that has started runs to completion (SNAP + finals), it just won't
+    # start the next one — so Stop never leaves a half-processed batch.
+    for i, chunk in enumerate(chunks, 1):
+        if stop_ev and stop_ev.is_set():
+            log(f"  [Stopped at batch boundary — halted before batch {i}/{_total}]"); return
+        _cgb = sum(os.path.getsize(z) for z in chunk if os.path.isfile(z)) * _EST / (1024**3)
+        log(f"\n── Batch {i}/{_total}: {len(chunk)} scene(s), ~{_cgb:.0f} GB .SAFE ──")
+        _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=chunk)
+        if cfg.get("do_snap"):
+            _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
+            # Finals per batch: turn this batch's SNAP GeoTIFFs into the final
+            # product now. _compute_indices scans the WHOLE snap_dir, so it also
+            # sweeps up any GeoTIFFs left over from an earlier interrupted run —
+            # not just this batch's. Runs before _clean_safe so the .SAFE delete
+            # check sees either the D: tile or the final in out_dir.
+            if cfg.get("do_indices"):
+                _compute_indices(cfg, snap_dir, cfg.get("out_dir", ""), log, progress_cb)
+            # free this chunk's .SAFE — only the ones actually converted, so a
+            # stop/failure never drops a date.
+            _clean_safe(safe_out, log, snap_dir, cfg)
+        _el = time.time() - _t0
+        if i < _total:
+            _eta = _el / i * (_total - i)
+            log(f"  ⏱ Batch {i}/{_total} done — {_fmt_dur(_el)} elapsed, "
+                f"est. {_fmt_dur(_eta)} left ({_total - i} batch(es) to go)")
+        if stop_ev and stop_ev.is_set():
+            log(f"  [Stopped — finished batch {i}/{_total}; halting before next]"); return
+
+
+def _rename_with_retry(src, dst, tries=6, delay=0.5):
+    """os.replace, retrying on Windows AccessDenied. Antivirus / Search indexer
+    briefly locks freshly-extracted files, so an immediate same-volume rename can
+    fail with WinError 5 even though nothing is wrong — a short backoff clears it.
+    ponytail: fixed retry schedule; if AV locks persist longer, raise `tries`."""
+    import time as _t
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except (PermissionError, OSError):
+            if i == tries - 1:
+                raise
+            _t.sleep(delay * (i + 1))
+
+
+def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
     """Extract any .zip archives in safe_dir that don't yet have a .SAFE counterpart.
 
     Integrity is checked at two points so bad data never reaches SNAP and no
@@ -1932,7 +2189,9 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
     pipeline will re-download whatever is missing.
     """
     import zipfile
-    zips = glob.glob(os.path.join(safe_dir, "*.zip"))
+    if cfg.get("_batch_defer"):
+        return   # batch mode extracts in chunks itself (see _process_in_batches)
+    zips = only_zips if only_zips is not None else glob.glob(os.path.join(safe_dir, "*.zip"))
     if not zips:
         return
     chk_zip, chk_safe = _load_integrity_checker()
@@ -1950,7 +2209,18 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
     _ek, _ex = _find_fast_extractor()
     _etool = {"7z": f"7-Zip ({_ex})", "tar": f"bsdtar ({_ex})",
               "zipfile": "Python zipfile (slow — install 7-Zip to speed this up)"}[_ek]
-    log(f"  Unzipping {n_zip} archive(s)  (parallel: {_uw} worker(s), extractor: {_etool})...")
+    # .SAFE output may live on a different (faster/healthier) drive than the zips.
+    # Zips are still read from — and deleted in — safe_dir; blank → old behaviour.
+    _safe_out = (cfg.get("safe_out_dir") or "").strip() or safe_dir
+    if _safe_out != safe_dir and cfg.get("dl_source") == "cdse_s3":
+        _safe_out = safe_dir
+    os.makedirs(_safe_out, exist_ok=True)
+    _stage_root = _unzip_stage_root(cfg, _safe_out)
+    _staging = not _same_volume(_stage_root, _safe_out)
+    _stagemsg = (f", scratch: {_stage_root} → move to output" if _staging
+                 else "")
+    log(f"  Unzipping {n_zip} archive(s)  (parallel: {_uw} worker(s), "
+        f"extractor: {_etool}{_stagemsg})...")
     _ulock = threading.Lock()
     _udone = [0]
 
@@ -1958,7 +2228,7 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
         if stop_ev and stop_ev.is_set():
             return
         stem = Path(zp).stem
-        safe_path = os.path.join(safe_dir, stem + ".SAFE")
+        safe_path = os.path.join(_safe_out, stem + ".SAFE")
 
         def _tick(msg):
             with _ulock:
@@ -1991,27 +2261,49 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg):
         # normalise the product folder to <stem>.SAFE (some tools drop the
         # suffix). The rename is a same-volume atomic move, so SNAP never sees a
         # half-extracted .SAFE and naming is guaranteed regardless of the tool.
-        tmp = os.path.join(safe_dir, f".__ext_{stem}")
+        tmp = os.path.join(_stage_root, f".__ext_{stem}")
+        _extracted_ok = False   # True once bytes are safely extracted; a failure
+                                # after this is placement (lock), NOT corruption
         try:
-            if os.path.isdir(tmp): shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isdir(tmp): _rmtree(tmp)
             os.makedirs(tmp, exist_ok=True)
-            _extract_archive(zp, tmp, log)
+            _extract_archive(zp, tmp, log, stop_ev)
             prod = _locate_safe_root(tmp)
             if prod is None:
                 raise RuntimeError("no manifest.safe found in extracted archive")
+            _extracted_ok = True
             if os.path.exists(safe_path):
-                shutil.rmtree(safe_path, ignore_errors=True)
-            os.replace(prod, safe_path)          # same volume → instant rename
+                _rmtree(safe_path)
+            if _same_volume(prod, safe_path):
+                _rename_with_retry(prod, safe_path)   # AV/indexer briefly locks fresh files
+            else:                                # scratch → output: bulk copy+rename
+                _move_tree_cross_volume(prod, safe_path, _safe_out, stem, log)
             log(f"    Unzipped: {stem}.SAFE")
+        except _ExtractStopped:
+            # user hit Stop — the half-extracted product is junk; the finally
+            # below deletes it. Keep the zip (it's fine) so the next run resumes.
+            log(f"    ⏹ stopped mid-unzip: {stem} — deleted partial extraction")
+            _tick(f"{stem[:28]}  ⏹ stopped"); return
         except Exception as e:
             import traceback as _tb
             log(f"    ERROR: could not unzip {Path(zp).name}: {e}")
             _write_error(cfg, stem, "unzip", _tb.format_exc())
+            if _extracted_ok:
+                # Extraction succeeded; only the move/rename failed (transient
+                # lock, dest busy). The zip is fine — KEEP it so the next run
+                # retries instead of silently dropping this date.
+                log(f"    Kept zip for retry (extraction OK, placement failed): {Path(zp).name}")
+                _tick(f"{stem[:28]}  ✗ move-failed (zip kept)"); return
             try: os.remove(zp); log(f"    Deleted corrupted zip: {Path(zp).name}")
             except Exception: pass
             _tick(f"{stem[:28]}  ✗ error"); return
         finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            # always delete the half-extracted temp and any partial cross-volume
+            # move staging, so Stop never leaves a half-unzipped product behind.
+            _rmtree(tmp)
+            _mv = os.path.join(_safe_out, f".__mv_{stem}")
+            if os.path.isdir(_mv):
+                _rmtree(_mv)
 
         # ── post-unzip check of the extracted .SAFE ──
         if chk_safe is not None and os.path.isdir(safe_path):
@@ -2114,6 +2406,11 @@ FILTER_DEFAULTS = {
     "IDAN":        {"filter":"IDAN","anSize":"50","estimateENL":"true","enl":"4.4"},
 }
 
+# Speckle filters offered in the Batch popup (all schema filters except "None",
+# which is handled as a separate checkbox). Defaults come from FILTER_DEFAULTS.
+SPECKLE_FILTER_NAMES = ["Boxcar", "Median", "Frost", "Lee", "Lee Sigma",
+                        "Gamma Map", "Refined Lee", "IDAN"]
+
 # ── DEM options ───────────────────────────────────────────────────────────────
 SNAP_DEMS = {
     "Copernicus 30m Global DEM": "Copernicus 30m  (recommended, GLO-30)",
@@ -2137,6 +2434,9 @@ SNAP_DEM_TAGS = {
     "ACE30":                    "ace30",
     "GETASSE30":                "getasse",
 }
+# short tag -> SNAP DEM name (for the compact Batch DEM pickers)
+SNAP_DEM_BY_TAG = {v: k for k, v in SNAP_DEM_TAGS.items()}
+DEM_TAG_LIST    = list(SNAP_DEM_TAGS.values())
 
 
 def _safe_float(text, default):
@@ -3479,18 +3779,44 @@ def _compute_indices(cfg, snap_dir, out_dir, log, progress_cb=None):
         pass
 
 
-def _clean_safe(safe_dir, log):
+def _clean_safe(safe_dir, log, snap_dir=None, cfg=None):
+    """Delete extracted .SAFE dirs in safe_dir.
+
+    When snap_dir is given, a .SAFE is deleted ONLY once a GeoTIFF (or .done
+    marker) for its (date, orbit) exists — so a run stopped or failed mid-SNAP
+    keeps the not-yet-converted .SAFE for the next start instead of losing that
+    date (the zip is already gone by this point). snap_dir=None → legacy
+    unconditional delete."""
     safes = sorted(set(
         glob.glob(os.path.join(safe_dir, "*.SAFE")) +
         glob.glob(os.path.join(safe_dir, "**", "*.SAFE"), recursive=True)
     ))
     safes = [s for s in safes if os.path.isdir(s)]
+
+    def _converted(s):
+        if snap_dir is None:
+            return True
+        date, _sat, orbit = _parse_safe_name(s)
+        if not date:
+            return False   # unparseable name — keep it, never risk deleting good data
+        pats = [os.path.join(snap_dir, f"S1_{date}_*_{orbit}*.tif"),
+                os.path.join(snap_dir, f"S1_{date}_*_{orbit}*.done")]
+        if cfg and cfg.get("out_dir"):
+            pats.append(os.path.join(cfg["out_dir"], orbit, f"S1_{date}_*_{orbit}_*.tif"))
+        return any(glob.glob(p) for p in pats)
+
+    removed = kept = 0
     for s in safes:
-        try:
-            shutil.rmtree(s)
-        except Exception:
-            pass
-    log(f"  Removed {len(safes)} .SAFE directories from {safe_dir}")
+        if _converted(s):
+            try: shutil.rmtree(s); removed += 1
+            except Exception: pass
+        else:
+            kept += 1
+    if kept:
+        log(f"  Removed {removed} converted .SAFE; KEPT {kept} not-yet-converted "
+            f".SAFE for next run (stopped/failed mid-SNAP)")
+    else:
+        log(f"  Removed {removed} .SAFE directories from {safe_dir}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3552,7 +3878,7 @@ class App(tk.Tk):
         w, h = 1100, 860
         x = (self.winfo_screenwidth()  - w) // 2
         y = (self.winfo_screenheight() - h) // 2
-        w = max(w, 1200); h = max(h, 720)
+        w = max(w, 1280); h = max(h, 720)  # extra width goes to the right panel (stretch='always')
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(1100, 720)
         # run dependency check after window is shown
@@ -3591,6 +3917,14 @@ class App(tk.Tk):
             self._lbl_idx_cpu.configure(text=msg, fg=color)
         except Exception:
             pass
+
+    def _unzip_stage_cfg(self):
+        """Value for cfg["unzip_stage_dir"] from the checkbox: "off" when unchecked,
+        else the previously-saved explicit path if a power-user set one, else "auto"."""
+        if not self.v_unzip_stage.get():
+            return "off"
+        prev = str(self._saved_cfg.get("unzip_stage_dir", "auto")).strip()
+        return prev if prev.lower() not in ("", "off", "auto") else "auto"
 
     def _update_unzip_cpu_label(self):
         """Refresh the live PC-load warning under the unzip workers spinbox."""
@@ -3706,14 +4040,14 @@ class App(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True)
         left  = tk.Frame(paned, bg=BG)
         right = tk.Frame(paned, bg=SURFACE)
-        paned.add(left,  minsize=600, width=660, stretch='never')
+        paned.add(left,  minsize=700, width=820, stretch='never')
         paned.add(right, minsize=300, stretch='always')
         try:
             self._build_form(left)
         except Exception as _be:
             import traceback; traceback.print_exc()
         self._build_log(right)
-        self.after(300, lambda: paned.sash_place(0, 660, 0))
+        self.after(300, lambda: paned.sash_place(0, 820, 0))
 
     def _section(self, parent, text):
         outer = tk.Frame(parent, bg=BG2); outer.pack(fill=tk.X, padx=8, pady=(12, 2))
@@ -4012,8 +4346,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         nb.add(t_dl,   text="  ⬇  Download  ")
         nb.add(t_proc, text="  ⚙  Processing  ")
         nb.add(t_out,  text="  📁  Output  ")
-        nb.add(t_calc, text="  🧮  Raster Calc  ")
         nb.add(t_batch, text="  🗂  Batch  ")
+        nb.add(t_calc, text="  🧮  Raster Calc  ")
 
         # ── DOWNLOAD TAB ─────────────────────────────────────────────────
         p = self._make_tab_scroll(t_dl)
@@ -4043,7 +4377,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                                bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
                                activebackground=BG, activeforeground=ACCENT_L,
                                command=self._on_source_change)
-        rb_ex = tk.Radiobutton(src_fr, text="Use existing .SAFE folder",
+        rb_ex_zip = tk.Radiobutton(src_fr, text="Use existing .zip folder  (skip download; unzip → SNAP → indices)",
+                               variable=self.v_safe_source, value="existing_zip",
+                               bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
+                               activebackground=BG, activeforeground=ACCENT_L,
+                               command=self._on_source_change)
+        rb_ex = tk.Radiobutton(src_fr, text="Use existing .SAFE folder  (skip download + unzip → SNAP → indices)",
                                variable=self.v_safe_source, value="existing",
                                bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
                                activebackground=BG, activeforeground=ACCENT_L,
@@ -4057,6 +4396,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         rb_dl.pack(anchor="w")
         rb_cdse.pack(anchor="w")
         rb_cdse_s3.pack(anchor="w")
+        rb_ex_zip.pack(anchor="w")
         rb_ex.pack(anchor="w")
         rb_ex_snap.pack(anchor="w")
 
@@ -4064,16 +4404,18 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self.existing_fr = tk.Frame(p, bg=BG2, bd=1, relief="flat")
         row_ex = tk.Frame(self.existing_fr, bg=BG2)
         row_ex.pack(fill=tk.X, padx=8, pady=6)
-        tk.Label(row_ex, text="Existing .SAFE folder:", font=FONT_BOLD,
-                 bg=BG2, fg=ACCENT_L).pack(side=tk.LEFT)
+        self._existing_lbl = tk.Label(row_ex, text="Existing .SAFE folder:", font=FONT_BOLD,
+                 bg=BG2, fg=ACCENT_L)
+        self._existing_lbl.pack(side=tk.LEFT)
         self.v_existing_safe = tk.StringVar(value="")
         tk.Entry(row_ex, textvariable=self.v_existing_safe,
                  font=FONT).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6,0))
         self._btn(row_ex, "Browse", lambda: self._browse_dir(self.v_existing_safe)
                   ).pack(side=tk.LEFT, padx=(4,0))
-        tk.Label(self.existing_fr,
+        self._existing_help = tk.Label(self.existing_fr,
                  text="  Download step will be skipped automatically.",
-                 font=(_FONT_FAM,9,"italic"), bg=BG2, fg=ACCENT_L).pack(anchor="w", padx=8, pady=(0,4))
+                 font=(_FONT_FAM,9,"italic"), bg=BG2, fg=ACCENT_L)
+        self._existing_help.pack(anchor="w", padx=8, pady=(0,4))
         self.existing_fr.pack_forget()
 
         # existing GeoTIFF folder picker (shown only when "existing_snap" selected)
@@ -4434,9 +4776,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._lbl_dem_net.pack(side=tk.LEFT, padx=(10, 0))
         def _chk_net():
             ok = _check_internet()
-            self._lbl_dem_net.configure(
-                text="online" if ok else "offline - use cached DEM only",
-                fg="#69F0AE" if ok else RED)
+            # ponytail: marshal Tk update back to main loop; worker thread can't touch widgets
+            def _apply(_lbl=self._lbl_dem_net):
+                if _lbl.winfo_exists():
+                    _lbl.configure(
+                        text="online" if ok else "offline - use cached DEM only",
+                        fg="#69F0AE" if ok else RED)
+            self._lbl_dem_net.after(0, _apply)
         threading.Thread(target=_chk_net, daemon=True).start()
         tk.Label(p,
                  text="  DEM auto-downloaded by SNAP on first use and cached locally.",
@@ -4480,6 +4826,21 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self.v_unzip_workers.trace_add(
             "write", lambda *_: self._update_unzip_cpu_label())
         self._update_unzip_cpu_label()
+
+        # Extract on a fast internal scratch, then move the finished .SAFE to the
+        # output drive. Big win when output is an external/slow drive: exploding
+        # thousands of tiny .SAFE files onto USB is latency-bound; internal NVMe
+        # eats the small-file IOPS, then one bulk robocopy move goes to USB.
+        # Self-disables when output is already on the same volume as the scratch.
+        self.v_unzip_stage = tk.BooleanVar(
+            value=(str(self._saved_cfg.get("unzip_stage_dir", "auto")).strip().lower()
+                   not in ("", "off")))
+        row_us = tk.Frame(p, bg=BG); row_us.pack(fill=tk.X, padx=14, pady=(2, 4))
+        tk.Checkbutton(
+            row_us, variable=self.v_unzip_stage,
+            text="Extract on internal SSD scratch, then move  (faster when output is an external/slow drive)",
+            font=(_FONT_FAM, 8), bg=BG, fg=FG2, selectcolor=BG2,
+            activebackground=BG, anchor="w").pack(side=tk.LEFT)
 
         # ── Parallel SNAP jobs ────────────────────────────────────────────
         self._section(p, "2f. Parallel SNAP Jobs")
@@ -4649,6 +5010,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         # ── Paths ─────────────────────────────────────────────────────────
         self._section(p, "10. Output Paths")
         self.v_safe_dir = tk.StringVar(value=self._saved_cfg.get("safe_dir", ""))
+        self.v_safe_out_dir = tk.StringVar(value=self._saved_cfg.get("safe_out_dir", ""))
         self.v_snap_dir = tk.StringVar(value=self._saved_cfg.get("snap_dir", ""))
         self.v_out_dir  = tk.StringVar(value=self._saved_cfg.get("out_dir", ""))
         self.v_gpt      = tk.StringVar(value=DEFAULT_GPT)
@@ -4659,9 +5021,10 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self.v_gdal.trace_add("write", lambda *_: self._schedule_dep_check())
 
         folder_defs = [
-            ("Raw .SAFE folder",      "Step 1 output — raw .SAFE dirs from ASF download", self.v_safe_dir),
-            ("SNAP GeoTIFF folder",   "Step 2 output — 2-band VH+VV GeoTIFF per scene (can be kept or deleted)", self.v_snap_dir),
-            ("COG indices folder",    "Step 3 final output — 7 separate COG files (VV, VH, CR, RVI, DIFFs)", self.v_out_dir),
+            ("Download / .zip folder", "Step 1 — .zip downloads land here; also holds .SAFE if the field below is blank", self.v_safe_dir),
+            (".SAFE unzip folder",     "Step 1b — extracted .SAFE go here (blank = same as .zip folder). Use a fast/healthy drive; zips are still deleted after extraction", self.v_safe_out_dir),
+            ("SNAP GeoTIFF folder",    "Step 2 output — 2-band VH+VV GeoTIFF per scene (can be kept or deleted)", self.v_snap_dir),
+            ("COG indices folder",     "Step 3 final output — 7 separate COG files (VV, VH, CR, RVI, DIFFs)", self.v_out_dir),
         ]
         for label, desc, var in folder_defs:
             grp = tk.Frame(p, bg=BG); grp.pack(fill=tk.X, padx=14, pady=(4,0))
@@ -4672,6 +5035,14 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                       ).pack(side=tk.LEFT, padx=(2,0))
             tk.Label(grp, text=f"  {desc}", font=(_FONT_FAM,8), bg=BG, fg=FG2,
                      anchor="w").pack(anchor="w")
+
+        # optional .SAFE scratch budget → chunked extract→SNAP→delete (keeps small/slow drives from filling)
+        self.v_safe_scratch_gb = tk.StringVar(value=str(self._saved_cfg.get("safe_scratch_gb", "")))
+        _sb = tk.Frame(p, bg=BG); _sb.pack(fill=tk.X, padx=14, pady=(6,0))
+        tk.Label(_sb, text="Max .SAFE scratch (GB)", font=FONT_BOLD, bg=BG, fg=FG, anchor="w").pack(side=tk.LEFT)
+        self._entry(_sb, self.v_safe_scratch_gb).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6,0))
+        tk.Label(p, text="  Blank = extract everything at once (old behaviour).  A number = process in chunks so only that many GB of .SAFE exist at once (extract → SNAP → delete → repeat).  'auto' = 80% of the .SAFE drive's free space.  Stops a small/slow drive filling up.  Needs SNAP enabled.",
+                 font=(_FONT_FAM,8), bg=BG, fg=FG2, anchor="w", justify="left", wraplength=760).pack(anchor="w", padx=14, pady=(0,4))
 
         # ── Output CRS ───────────────────────────────────────────
         self._section(p, "11. Output CRS  (reprojection applied after processing)")
@@ -5026,6 +5397,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
 
     def _schedule_dep_check(self):
         """Debounced dep check — collapses multiple rapid calls into one."""
+        if getattr(self, "_suppress_dep_trace", False):
+            return   # programmatic auto-fill, not a user edit — no re-check
         if getattr(self, "_dep_check_pending", False):
             return
         self._dep_check_pending = True
@@ -5111,13 +5484,17 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 self._log(f"  [  ✗   ] {name}: {detail.split(chr(10))[0]}")
         self._log("----------------------")
 
-        # auto-fill gdal path in UI if it was found and field is empty
+        # auto-fill gdal path in UI if it was found and field is empty.
+        # Suppress the write-trace so this programmatic set doesn't kick off a
+        # second dep check (the path is the one we just checked).
         for name, (ok, detail) in results.items():
             if ok is True and "gdal" in name.lower() and hasattr(self, "v_gdal"):
                 if not self.v_gdal.get().strip():
                     found_path = detail.split("\n")[0].strip()
                     if os.path.isfile(found_path):
+                        self._suppress_dep_trace = True
                         self.v_gdal.set(found_path)
+                        self._suppress_dep_trace = False
 
         # print installation instructions for anything missing
         if has_missing:
@@ -5200,6 +5577,134 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         y = self.winfo_y() + 200
         popup.geometry(f"+{x}+{y}")
         popup.focus_set()
+
+    def _show_calendar_range(self, start_var, end_var):
+        """One calendar, two clicks: first sets start, second sets end
+        (auto-ordered). Fills start_var/end_var as YYYY-MM-DD."""
+        import datetime
+        popup = tk.Toplevel(self)
+        popup.title("Select date range")
+        popup.resizable(False, False)
+        popup.grab_set()
+        popup.configure(bg=BG)
+        try:
+            d = datetime.datetime.strptime(start_var.get(), "%Y-%m-%d").date()
+        except Exception:
+            d = datetime.date.today()
+        from tkcalendar import Calendar as _Cal
+        info = tk.Label(popup, text="Click the START date…", bg=BG, fg=ACCENT_L, font=FONT_BOLD)
+        info.pack(padx=10, pady=(10, 4))
+        cal = _Cal(popup, selectmode="day", year=d.year, month=d.month, day=d.day,
+                   date_pattern="yyyy-mm-dd",
+                   background=BG2, foreground=FG, selectbackground=ACCENT, selectforeground=WHITE,
+                   headersbackground=ACCENT2, headersforeground=WHITE,
+                   normalbackground=BG, normalforeground=FG,
+                   weekendbackground=BG, weekendforeground=ACCENT_L,
+                   othermonthbackground=BG, othermonthforeground=FG2, font=FONT)
+        cal.pack(padx=10, pady=(0, 10))
+        state = {"start": None}
+        def _on_click(_e=None):
+            picked = cal.get_date()   # yyyy-mm-dd sorts lexicographically
+            if state["start"] is None:
+                state["start"] = picked
+                info.configure(text=f"Start: {picked}  —  now click the END date")
+            else:
+                a, b = sorted([state["start"], picked])
+                start_var.set(a); end_var.set(b)
+                popup.destroy()
+        cal.bind("<<CalendarSelected>>", _on_click)
+        self._btn(popup, "  Cancel  ", popup.destroy, color=BG2, pady=6).pack(pady=(0, 12))
+        popup.update_idletasks()
+        popup.geometry(f"+{self.winfo_x() + 200}+{self.winfo_y() + 160}")
+        popup.focus_set()
+
+    def _speckle_spec(self, name, params=None):
+        """Map a batch speckle choice to (speckle_key, speckle_params).
+        Accepts filter display names, legacy keys (lee/gamma/none), or None.
+        Uses the popup-tuned params for that filter when the caller passes none,
+        so tuning applies across every mode."""
+        if name in ("none", "None", "", None):
+            return ("none", None)
+        name = {"lee": "Lee Sigma", "gamma": "Gamma Map"}.get(name, name)
+        if name in FILTER_DEFAULTS:
+            params = params or self._batch_speckle_params.get(name) or FILTER_DEFAULTS[name]
+            return ("custom", dict(params))
+        return ("none", None)
+
+    def _batch_speckle_summary(self):
+        on = [n for n in (["None"] + SPECKLE_FILTER_NAMES)
+              if self._batch_speckle_on.get(n) and self._batch_speckle_on[n].get()]
+        return ("  → " + ", ".join(on)) if on else "  (none selected)"
+
+    def _open_batch_speckle_popup(self):
+        dlg = tk.Toplevel(self)
+        dlg.title("Batch speckle filters")
+        dlg.configure(bg=BG); dlg.resizable(False, False); dlg.grab_set()
+        tk.Label(dlg, text="  Select speckle filters to run (one output per filter).\n"
+                 "  Use Configure to tune a filter's parameters.",
+                 font=FONT, bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+        body = tk.Frame(dlg, bg=BG); body.pack(fill=tk.X, padx=18, pady=4)
+        for name in ["None"] + SPECKLE_FILTER_NAMES:
+            row = tk.Frame(body, bg=BG); row.pack(fill=tk.X, pady=1)
+            tk.Checkbutton(row, text=name, variable=self._batch_speckle_on[name],
+                           bg=BG, font=FONT, fg=FG, width=16, anchor="w",
+                           selectcolor=BG2, activebackground=BG,
+                           activeforeground=ACCENT_L).pack(side=tk.LEFT)
+            if name != "None" and FILTER_SCHEMAS.get(name):
+                self._btn(row, "Configure", lambda n=name: self._open_filter_config(n),
+                          color=BG2, font=(_FONT_FAM, 9)).pack(side=tk.LEFT, padx=6)
+        def _close():
+            self._lbl_batch_speckle.configure(text=self._batch_speckle_summary())
+            dlg.destroy()
+        self._btn(dlg, "  Done  ", _close, pady=8).pack(pady=(8, 12))
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_x() + 180}+{self.winfo_y() + 120}")
+
+    def _open_filter_config(self, name):
+        """Schema-driven param editor for one batch speckle filter (mirrors the
+        single-AOI custom dialog, but writes into self._batch_speckle_params)."""
+        schema = FILTER_SCHEMAS.get(name, [])
+        if not schema:
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure — {name}")
+        dlg.configure(bg=BG); dlg.resizable(False, False); dlg.grab_set()
+        saved = self._batch_speckle_params.get(name, dict(FILTER_DEFAULTS.get(name, {})))
+        pvars = {}
+        for item in schema:
+            key, wtype, lbl = item[0], item[1], item[2]
+            row = tk.Frame(dlg, bg=BG); row.pack(fill=tk.X, padx=14, pady=3)
+            tk.Label(row, text=lbl, font=FONT, bg=BG, fg=FG, width=24, anchor="w").pack(side=tk.LEFT)
+            if wtype == "bool":
+                var = tk.BooleanVar(value=(saved.get(key, "true" if item[3] else "false") == "true"))
+                tk.Checkbutton(row, variable=var, bg=BG, selectcolor=BG2,
+                               activebackground=BG, fg=FG, activeforeground=ACCENT_L).pack(side=tk.LEFT)
+            elif wtype == "choice":
+                choices, dflt = item[3], item[4]
+                cur = saved.get(key, dflt)
+                var = tk.StringVar(value=cur if cur in choices else dflt)
+                self._mk_optmenu(row, var, choices).pack(side=tk.LEFT)
+            else:
+                mn, mx, dflt = item[3], item[4], item[5]
+                var = tk.StringVar(value=saved.get(key, str(dflt)))
+                self._entry(row, var, width=8).pack(side=tk.LEFT)
+                tk.Label(row, text=f"  ({mn}-{mx})", font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(side=tk.LEFT)
+            pvars[key] = var
+        def _apply():
+            params = dict(FILTER_DEFAULTS.get(name, {"filter": name}))
+            for item in schema:
+                key, wtype = item[0], item[1]
+                v = pvars[key].get()
+                params[key] = ("true" if v else "false") if wtype == "bool" else str(v).strip()
+            self._batch_speckle_params[name] = params
+            self._batch_speckle_on[name].set(True)   # tuning implies selected
+            dlg.destroy()
+        _bfr = tk.Frame(dlg, bg=BG); _bfr.pack(fill=tk.X, padx=14, pady=10)
+        self._btn(_bfr, "  Apply  ", _apply).pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn(_bfr, "  Cancel  ", dlg.destroy, color=BG2).pack(side=tk.RIGHT)
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_x() + 220}+{self.winfo_y() + 140}")
+
     def _on_remember_change(self):
         """Save or clear credentials when checkbox changes. Stored in plain text
         in sar_foundry_config.json — the CDSE password is included at the user's
@@ -5407,7 +5912,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self.existing_fr.pack_forget()
         self.existing_snap_fr.pack_forget()
 
-        if src == "existing":
+        if src in ("existing", "existing_zip"):
             self.existing_fr.pack(fill=tk.X, padx=10, pady=(0, 4))
             self.v_do_dl.set(False)
             self.v_do_snap.set(True)
@@ -5415,7 +5920,16 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 self.chk_dl.configure(state=tk.DISABLED)
             if hasattr(self, "chk_snap"):
                 self.chk_snap.configure(state=tk.NORMAL)
-            # auto-fill from "Raw .SAFE folder" if still empty
+            _iszip = (src == "existing_zip")
+            if hasattr(self, "_existing_lbl"):
+                self._existing_lbl.configure(
+                    text="Existing .zip folder:" if _iszip else "Existing .SAFE folder:")
+            if hasattr(self, "_existing_help"):
+                self._existing_help.configure(
+                    text=("  Download skipped. These .zip are unzipped (to the '.SAFE unzip "
+                          "folder' if you set one), then SNAP-processed." if _iszip
+                          else "  Download + unzip skipped. .SAFE go straight to SNAP."))
+            # auto-fill from the Download/.zip folder if still empty
             if hasattr(self, "v_existing_safe") and not self.v_existing_safe.get().strip():
                 candidate = getattr(self, "v_safe_dir", None)
                 if candidate and candidate.get().strip() and os.path.isdir(candidate.get().strip()):
@@ -5444,17 +5958,33 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 self.chk_snap.configure(state=tk.NORMAL)
 
     # ── Batch AOI runner ────────────────────────────────────────────────
-    def _mk_optmenu(self, parent, var, options):
+    def _mk_optmenu(self, parent, var, options, width=8):
         om = tk.OptionMenu(parent, var, *options)
         om.configure(bg=BG2, fg=FG, activebackground=BG, activeforeground=ACCENT_L,
-                     relief="flat", font=(_FONT_FAM, 9), highlightthickness=0, width=8)
+                     relief="flat", font=(_FONT_FAM, 9), highlightthickness=0,
+                     width=width, anchor="w")
         om["menu"].configure(bg=BG2, fg=FG, activebackground=ACCENT2, activeforeground=WHITE)
         return om
 
     def _build_batch_tab(self, parent):
         p = self._make_tab_scroll(parent)
-        self._batch_aois = []
-        self._batch_per_aoi = {}   # aoi_path -> (preset_var, speckle_var)
+        _bsaved = self._saved_cfg.get("batch", {})
+        # only AOIs that still exist survive a reload
+        self._batch_aois = [a for a in _bsaved.get("aois", []) if os.path.isfile(a)]
+        self._batch_per_aoi = {}   # aoi_path -> (preset_var, speckle_var, start_var, end_var)
+        self._batch_saved_per_aoi = _bsaved.get("per_aoi", {})  # seeds per-AOI rows on rebuild
+        # speckle selection state for the popup (all-combinations mode)
+        _sp_saved = _bsaved.get("speckle_params", {})
+        _sp_on    = set(_bsaved.get("all_speckles_on", ["Lee Sigma"]))
+        self._batch_speckle_on = {n: tk.BooleanVar(value=(n in _sp_on))
+                                  for n in ["None"] + SPECKLE_FILTER_NAMES}
+        self._batch_speckle_params = {n: dict(_sp_saved.get(n, FILTER_DEFAULTS.get(n, {"filter": n})))
+                                      for n in SPECKLE_FILTER_NAMES}
+        # DEM is a third per-mode dimension (short tags: cop30, srtm1, …)
+        _dem_default = SNAP_DEM_TAGS.get(self.v_dem.get(), "cop30")
+        _dem_on = set(_bsaved.get("all_dems", [_dem_default]))
+        self.v_batch_dem = tk.StringVar(value=_bsaved.get("uniform_dem", _dem_default))
+        self.v_batch_cd = {t: tk.BooleanVar(value=(t in _dem_on)) for t in DEM_TAG_LIST}
 
         tk.Label(p, text="Batch: process many AOIs in one sequential run. Each AOI (and each\n"
                          "pipeline) gets its own auto-named output folder. AOIs run one after another.",
@@ -5478,61 +6008,110 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
 
         # 2. Pipeline assignment
         self._section(p, "2. Pipeline assignment")
-        self.v_batch_mode = tk.StringVar(value="uniform")
+        self.v_batch_mode = tk.StringVar(value=_bsaved.get("mode", "uniform"))
         for _val, _lbl in [
-            ("uniform", "Same pipeline + speckle for all AOIs"),
-            ("all",     "All combinations — every AOI × selected pipelines × speckles"),
-            ("per_aoi", "Per-AOI — choose pipeline + speckle for each AOI"),
+            ("uniform", "Same pipeline + speckle + DEM for all AOIs"),
+            ("all",     "All combinations — every AOI × pipelines × speckles × DEMs"),
+            ("per_aoi", "Per-AOI — choose pipeline + speckle + DEM for each AOI"),
         ]:
             tk.Radiobutton(p, text=_lbl, variable=self.v_batch_mode, value=_val,
                            bg=BG, font=FONT_BOLD, fg=ACCENT_L, selectcolor=BG2,
                            activebackground=BG, activeforeground=ACCENT_L,
                            command=self._on_batch_mode_change).pack(anchor="w", padx=14)
 
+        _spk_opts = ["none"] + SPECKLE_FILTER_NAMES
         self.batch_uniform_fr = tk.Frame(p, bg=BG)
-        self.v_batch_preset  = tk.StringVar(value="sigma0")
-        self.v_batch_speckle = tk.StringVar(value="lee")
+        self.v_batch_preset  = tk.StringVar(value=_bsaved.get("uniform_preset", PRESET_LABELS["sigma0"]))
+        self.v_batch_speckle = tk.StringVar(value=_bsaved.get("uniform_speckle", "Lee Sigma"))
         _u1 = tk.Frame(self.batch_uniform_fr, bg=BG); _u1.pack(fill=tk.X, padx=28, pady=2)
         tk.Label(_u1, text="Pipeline", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
-        self._mk_optmenu(_u1, self.v_batch_preset, ["sigma0", "gamma0"]).pack(side=tk.LEFT)
+        self._mk_optmenu(_u1, self.v_batch_preset, list(PRESET_LABELS.values()), width=15).pack(side=tk.LEFT)
         tk.Label(_u1, text="  Speckle", font=FONT, bg=BG, fg=FG).pack(side=tk.LEFT)
-        self._mk_optmenu(_u1, self.v_batch_speckle, ["none", "lee", "gamma"]).pack(side=tk.LEFT)
+        self._mk_optmenu(_u1, self.v_batch_speckle, _spk_opts, width=12).pack(side=tk.LEFT)
+        _u2 = tk.Frame(self.batch_uniform_fr, bg=BG); _u2.pack(fill=tk.X, padx=28, pady=2)
+        tk.Label(_u2, text="DEM", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
+        self._mk_optmenu(_u2, self.v_batch_dem, DEM_TAG_LIST, width=15).pack(side=tk.LEFT)
 
         self.batch_all_fr = tk.Frame(p, bg=BG)
-        self.v_batch_cp = {k: tk.BooleanVar(value=(k == "sigma0")) for k in ("sigma0", "gamma0")}
-        self.v_batch_cs = {k: tk.BooleanVar(value=(k == "lee"))    for k in ("none", "lee", "gamma")}
+        _saved_cp = set(_bsaved.get("all_presets", ["sigma0"]))
+        self.v_batch_cp = {k: tk.BooleanVar(value=(k in _saved_cp)) for k in ("sigma0", "gamma0")}
         _c1 = tk.Frame(self.batch_all_fr, bg=BG); _c1.pack(fill=tk.X, padx=28, pady=2)
         tk.Label(_c1, text="Pipelines", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
         for k in ("sigma0", "gamma0"):
-            tk.Checkbutton(_c1, text=k, variable=self.v_batch_cp[k], bg=BG, font=FONT, fg=FG,
+            tk.Checkbutton(_c1, text=PRESET_LABELS[k], variable=self.v_batch_cp[k], bg=BG, font=FONT, fg=FG,
                            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=4)
         _c2 = tk.Frame(self.batch_all_fr, bg=BG); _c2.pack(fill=tk.X, padx=28, pady=2)
         tk.Label(_c2, text="Speckles", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT)
-        for k in ("none", "lee", "gamma"):
-            tk.Checkbutton(_c2, text=k, variable=self.v_batch_cs[k], bg=BG, font=FONT, fg=FG,
-                           selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT, padx=4)
+        self._btn(_c2, "Select speckle filters…", self._open_batch_speckle_popup,
+                  color=BG2).pack(side=tk.LEFT)
+        self._lbl_batch_speckle = tk.Label(_c2, text=self._batch_speckle_summary(),
+                                            font=(_FONT_FAM, 8, "italic"), bg=BG, fg=FG2)
+        self._lbl_batch_speckle.pack(side=tk.LEFT, padx=(6, 0))
+        _c3 = tk.Frame(self.batch_all_fr, bg=BG); _c3.pack(fill=tk.X, padx=28, pady=2)
+        tk.Label(_c3, text="DEMs", font=FONT, bg=BG, fg=FG, width=10, anchor="w").pack(side=tk.LEFT, anchor="n")
+        _cd_grid = tk.Frame(_c3, bg=BG); _cd_grid.pack(side=tk.LEFT)
+        for _i, t in enumerate(DEM_TAG_LIST):
+            tk.Checkbutton(_cd_grid, text=t, variable=self.v_batch_cd[t], bg=BG, font=FONT, fg=FG,
+                           selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L
+                           ).grid(row=_i // 4, column=_i % 4, sticky="w", padx=4)
 
         self.batch_per_fr = tk.Frame(p, bg=BG)
-        tk.Label(self.batch_per_fr, text="  (one row per AOI — add AOIs above first)",
+        tk.Label(self.batch_per_fr, text="  (one row per AOI — add AOIs above first).  "
+                 "Dates: YYYY-MM-DD, default = Download tab's range.",
                  font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=28)
+        self._btn(self.batch_per_fr, "Apply row 1's dates to all", self._batch_apply_row1_dates,
+                  color=BG2).pack(anchor="w", padx=28, pady=(0, 2))
+        _ph = tk.Frame(self.batch_per_fr, bg=BG); _ph.pack(fill=tk.X, padx=28)
+        tk.Label(_ph, text="AOI", font=(_FONT_FAM, 8), bg=BG, fg=FG2, width=24, anchor="w").pack(side=tk.LEFT)
+        tk.Label(_ph, text="pipeline / speckle / DEM / start / end", font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(side=tk.LEFT)
         self.batch_per_rows = tk.Frame(self.batch_per_fr, bg=BG); self.batch_per_rows.pack(fill=tk.X, padx=28)
 
-        # 3. Output base
-        self._section(p, "3. Output base folder")
-        self.v_batch_out = tk.StringVar(value=self._saved_cfg.get("batch_out", ""))
+        # 3. Common settings (shared by every AOI) — bound to the same vars as
+        # the Download/Processing tabs, so editing here edits the shared state.
+        self._section(p, "3. Common settings (all AOIs)")
+        _cs = tk.Frame(p, bg=BG); _cs.pack(fill=tk.X, padx=28, pady=(2, 0))
+        tk.Label(_cs, text="Output bands", font=FONT, bg=BG, fg=FG, width=12, anchor="w").pack(side=tk.LEFT)
+        def _toggle_batch_bands():
+            new = not all(self.v_bands[b].get() for b in ALL_BANDS)
+            for b in ALL_BANDS: self.v_bands[b].set(new)
+        for b in ALL_BANDS:
+            tk.Checkbutton(_cs, text=b, variable=self.v_bands[b], bg=BG, font=FONT, fg=FG,
+                           selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L).pack(side=tk.LEFT)
+        self._btn(_cs, "all/none", _toggle_batch_bands, color=BG2, font=(_FONT_FAM, 8)).pack(side=tk.LEFT, padx=(6, 0))
+
+        _cw = tk.Frame(p, bg=BG); _cw.pack(fill=tk.X, padx=28, pady=(4, 0))
+        tk.Label(_cw, text="Workers", font=FONT, bg=BG, fg=FG, width=12, anchor="w").pack(side=tk.LEFT)
+        for _lbl, _var, _lo, _hi in [("unzip", self.v_unzip_workers, 1, 8),
+                                     ("SNAP jobs", self.v_snap_workers, 1, 4),
+                                     ("index", self.v_idx_workers, 1, 8)]:
+            tk.Label(_cw, text=_lbl, font=(_FONT_FAM, 9), bg=BG, fg=FG2).pack(side=tk.LEFT, padx=(6, 2))
+            tk.Spinbox(_cw, from_=_lo, to=_hi, width=3, textvariable=_var, font=FONT,
+                       bg=BG2, fg=FG, insertbackground=FG, relief="flat", justify="center").pack(side=tk.LEFT)
+
+        _ck = tk.Frame(p, bg=BG); _ck.pack(fill=tk.X, padx=28, pady=(4, 0))
+        self._btn(_ck, "Speckle filter parameters…", self._open_batch_speckle_popup,
+                  color=BG2, font=(_FONT_FAM, 9)).pack(side=tk.LEFT)
+        tk.Label(_ck, text="  tune per-filter params (applies wherever that filter runs)",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(side=tk.LEFT)
+
+        # 4. Output base
+        self._section(p, "4. Output base folder")
+        self.v_batch_out = tk.StringVar(value=_bsaved.get("out", self._saved_cfg.get("batch_out", "")))
         row = tk.Frame(p, bg=BG); row.pack(fill=tk.X, padx=14, pady=2)
         self._entry(row, self.v_batch_out).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._btn(row, "…", lambda: self._browse_dir(self.v_batch_out)).pack(side=tk.LEFT, padx=(4, 0))
-        tk.Label(p, text="  Outputs →  <base>/<AOI>/<pipeline[_speckle]>/ ;  downloads shared per AOI in\n"
-                         "  <base>/<AOI>/_safe/ .  Dates, source, credentials, satellites, bands, scales and\n"
-                         "  workers come from the Download/Processing tabs.",
+        tk.Label(p, text="  Outputs →  <base>/<AOI>/<pipeline_speckle_DEM>/ ;  downloads shared per AOI in\n"
+                         "  <base>/<AOI>/_safe/ .  Source, credentials, satellites, orbit and scale (dB/linear)\n"
+                         "  come from the Download/Processing tabs.",
                  font=(_FONT_FAM, 8), bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(0, 6))
 
         self.btn_batch = self._btn(p, "▶  Run Batch", self._on_run_batch,
                                    pady=10, font=(_FONT_FAM, 12, "bold"))
         self.btn_batch.pack(fill=tk.X, padx=14, pady=(2, 8))
-        tk.Label(p, text="  Use the STOP button (bottom) to halt — the current AOI finishes, the rest are skipped.",
-                 font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=14, pady=(0, 10))
+        tk.Label(p, text="  STOP (bottom) halts after the current scene; partial downloads are kept.\n"
+                         "  The batch is saved on Run: reopen the app and the same list is here. Finished\n"
+                         "  AOIs drop off automatically; unfinished ones stay and resume from disk.",
+                 font=(_FONT_FAM, 8), bg=BG, fg=FG2, justify="left").pack(anchor="w", padx=14, pady=(0, 10))
 
         self._on_batch_mode_change()
 
@@ -5590,21 +6169,56 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         for w in self.batch_per_rows.winfo_children():
             w.destroy()
         new_map = {}
+        _spk_opts = ["none"] + SPECKLE_FILTER_NAMES
+        _dem_default = SNAP_DEM_TAGS.get(self.v_dem.get(), "cop30")
         for pth in self._batch_aois:
             prev = self._batch_per_aoi.get(pth)
-            pv = prev[0] if prev else tk.StringVar(value="sigma0")
-            sv = prev[1] if prev else tk.StringVar(value="lee")
-            new_map[pth] = (pv, sv)
+            saved = self._batch_saved_per_aoi.get(pth, {})   # from persisted config
+            pv = prev[0] if prev else tk.StringVar(value=saved.get("preset", PRESET_LABELS["sigma0"]))
+            sv = prev[1] if prev else tk.StringVar(value=saved.get("speckle", "Lee Sigma"))
+            stv = prev[2] if prev and len(prev) > 2 else tk.StringVar(value=saved.get("start", self.v_start.get()))
+            env = prev[3] if prev and len(prev) > 3 else tk.StringVar(value=saved.get("end", self.v_end.get()))
+            dv = prev[4] if prev and len(prev) > 4 else tk.StringVar(value=saved.get("dem", _dem_default))
+            new_map[pth] = (pv, sv, stv, env, dv)
             row = tk.Frame(self.batch_per_rows, bg=BG); row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=os.path.basename(pth)[:30], font=(_FONT_FAM, 8), bg=BG, fg=FG,
-                     width=32, anchor="w").pack(side=tk.LEFT)
-            self._mk_optmenu(row, pv, ["sigma0", "gamma0"]).pack(side=tk.LEFT)
-            self._mk_optmenu(row, sv, ["none", "lee", "gamma"]).pack(side=tk.LEFT, padx=4)
+            tk.Label(row, text=os.path.basename(pth)[:24], font=(_FONT_FAM, 8), bg=BG, fg=FG,
+                     width=24, anchor="w").pack(side=tk.LEFT)
+            self._mk_optmenu(row, pv, list(PRESET_LABELS.values()), width=14).pack(side=tk.LEFT)
+            self._mk_optmenu(row, sv, _spk_opts, width=11).pack(side=tk.LEFT, padx=3)
+            self._mk_optmenu(row, dv, DEM_TAG_LIST, width=8).pack(side=tk.LEFT, padx=3)
+            self._entry(row, stv, width=10).pack(side=tk.LEFT, padx=(3, 0))
+            self._entry(row, env, width=10).pack(side=tk.LEFT, padx=(3, 0))
+            if HAS_CALENDAR:
+                self._btn(row, "📅", lambda s=stv, e=env: self._show_calendar_range(s, e),
+                          color=BG2, font=(_FONT_FAM, 10)).pack(side=tk.LEFT, padx=(3, 0))
         self._batch_per_aoi = new_map
 
-    def _batch_cfg(self, aoi_path, preset, speckle, out_base):
+    def _batch_apply_row1_dates(self):
+        if not self._batch_aois:
+            return
+        first = self._batch_per_aoi.get(self._batch_aois[0])
+        if not first or len(first) < 4:
+            return
+        start, end = first[2].get(), first[3].get()
+        for pth in self._batch_aois[1:]:
+            row = self._batch_per_aoi.get(pth)
+            if row and len(row) >= 4:
+                row[2].set(start); row[3].set(end)
+
+    def _batch_cfg(self, aoi_path, preset, speckle, out_base, start_date=None, end_date=None,
+                   speckle_params=None, dem=None):
+        preset = PRESET_KEYS.get(preset, preset)   # pretty label -> internal key
+        dem_tag  = dem or SNAP_DEM_TAGS.get(self.v_dem.get(), "cop30")
+        dem_name = SNAP_DEM_BY_TAG.get(dem_tag, SNAP_DEM_DEFAULT)
         aoi_label = re.sub(r"[^A-Za-z0-9_-]", "_", Path(aoi_path).stem) or "AOI"
-        sub = preset + ("" if speckle in ("none", None, "") else f"_{speckle}")
+        # folder suffix from the actual filter name + DEM (e.g. sigma0_lee_sigma_cop30)
+        if speckle == "custom" and speckle_params:
+            sfx = speckle_params.get("filter", "custom").lower().replace(" ", "_")
+        elif speckle in ("none", None, ""):
+            sfx = "nospeckle"
+        else:
+            sfx = speckle
+        sub = f"{preset}_{sfx}_{dem_tag}"
         aoi_root = os.path.join(out_base, aoi_label)
         safe_dir = os.path.join(aoi_root, "_safe")            # per-AOI, shared across its combos
         snap_dir = os.path.join(aoi_root, sub, "_snap")
@@ -5617,7 +6231,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         if not scales:          scales = ["linear"]
         return {
             "aoi_path": aoi_path, "aoi_wkt": None, "aoi_label": aoi_label,
-            "start_date": self.v_start.get(), "end_date": self.v_end.get(),
+            "start_date": start_date or self.v_start.get(),
+            "end_date": end_date or self.v_end.get(),
             "orbit_dir": self.v_orbit.get(),
             "satellites": [s for s, v in self.v_sat.items() if v.get()] or ["S1A", "S1B", "S1C"],
             "asf_token": self.v_token.get(),
@@ -5634,11 +6249,11 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 if en.get() and n.get().strip() and e.get().strip()
             ],
             "scales": scales,
-            "safe_dir": safe_dir, "snap_dir": snap_dir, "out_dir": out_dir,
+            "safe_dir": safe_dir, "safe_out_dir": "", "safe_scratch_gb": "", "snap_dir": snap_dir, "out_dir": out_dir,
             "gpt_path": self.v_gpt.get(),
             "graph_path": graph_path, "graph_preset": preset,
-            "speckle": speckle, "speckle_params": None,
-            "dem_name": self.v_dem.get(), "mosaic_method": self.v_mosaic_method.get(),
+            "speckle": speckle, "speckle_params": speckle_params,
+            "dem_name": dem_name, "mosaic_method": self.v_mosaic_method.get(),
             "cluster_aoi": bool(self.v_cluster_aoi.get()),
             "cluster_gap_km": _safe_float(self.v_cluster_gap.get(), 5.0),
             "fields_path": (self.v_fields_path.get() or "").strip(),
@@ -5646,12 +6261,38 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "max_dl_workers": int(self.v_dl_workers.get()),
             "s3_workers": int(self.v_s3_workers.get()),
             "unzip_workers": int(self.v_unzip_workers.get()),
+            "unzip_stage_dir": self._unzip_stage_cfg(),
             "max_idx_workers": int(self.v_idx_workers.get()),
             "max_snap_workers": int(self.v_snap_workers.get()),
             "jvm_mb": int(self.v_jvm_mb.get()),
             "gdal_path": self.v_gdal.get().strip(),
             "output_crs": self.v_crs.get().strip(),
         }
+
+    def _save_batch_state(self):
+        """Persist the batch setup so reopening the app re-arms it."""
+        per_aoi = dict(self._batch_saved_per_aoi)
+        for pth, row in self._batch_per_aoi.items():
+            if len(row) >= 5:
+                pv, sv, stv, env, dv = row
+                per_aoi[pth] = {"preset": pv.get(), "speckle": sv.get(),
+                                "start": stv.get(), "end": env.get(), "dem": dv.get()}
+        per_aoi = {a: per_aoi[a] for a in self._batch_aois if a in per_aoi}
+        self._batch_saved_per_aoi = per_aoi
+        _save_config({"batch": {
+            "aois": list(self._batch_aois),
+            "mode": self.v_batch_mode.get(),
+            "out": self.v_batch_out.get().strip(),
+            "uniform_preset": self.v_batch_preset.get(),
+            "uniform_speckle": self.v_batch_speckle.get(),
+            "uniform_dem": self.v_batch_dem.get(),
+            "all_presets": [k for k, v in self.v_batch_cp.items() if v.get()],
+            "all_speckles_on": [n for n in (["None"] + SPECKLE_FILTER_NAMES)
+                                if self._batch_speckle_on[n].get()],
+            "all_dems": [t for t in DEM_TAG_LIST if self.v_batch_cd[t].get()],
+            "speckle_params": self._batch_speckle_params,
+            "per_aoi": per_aoi,
+        }})
 
     def _on_run_batch(self):
         if self._running:
@@ -5666,22 +6307,35 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             messagebox.showerror("Batch", "Set an output base folder (section 3)."); return
 
         mode = self.v_batch_mode.get()
+        g_start, g_end = self.v_start.get(), self.v_end.get()
+        # jobs: (aoi, preset, speckle_key, speckle_params, dem_tag, start, end)
         if mode == "uniform":
-            jobs = [(a, self.v_batch_preset.get(), self.v_batch_speckle.get())
+            sk, sp = self._speckle_spec(self.v_batch_speckle.get())
+            dem = self.v_batch_dem.get()
+            jobs = [(a, self.v_batch_preset.get(), sk, sp, dem, g_start, g_end)
                     for a in self._batch_aois]
         elif mode == "all":
             presets  = [k for k, v in self.v_batch_cp.items() if v.get()]
-            speckles = [k for k, v in self.v_batch_cs.items() if v.get()]
-            if not presets or not speckles:
-                messagebox.showerror("Batch", "Select at least one pipeline and one speckle."); return
-            jobs = [(a, p, s) for a in self._batch_aois for p in presets for s in speckles]
+            spk_names = [n for n in (["None"] + SPECKLE_FILTER_NAMES)
+                         if self._batch_speckle_on[n].get()]
+            dems = [t for t in DEM_TAG_LIST if self.v_batch_cd[t].get()]
+            if not presets or not spk_names or not dems:
+                messagebox.showerror("Batch", "Select at least one pipeline, one speckle filter and one DEM."); return
+            speckles = [self._speckle_spec("none" if n == "None" else n,
+                                           self._batch_speckle_params.get(n))
+                        for n in spk_names]
+            jobs = [(a, p, sk, sp, d, g_start, g_end)
+                    for a in self._batch_aois for p in presets
+                    for (sk, sp) in speckles for d in dems]
         else:  # per_aoi
             jobs = []
             for a in self._batch_aois:
-                pv, sv = self._batch_per_aoi.get(a, (None, None))
-                if pv is None:
+                row = self._batch_per_aoi.get(a)
+                if not row:
                     messagebox.showerror("Batch", "Per-AOI table not built — reselect Per-AOI mode."); return
-                jobs.append((a, pv.get(), sv.get()))
+                pv, sv, stv, env, dv = row
+                sk, sp = self._speckle_spec(sv.get())
+                jobs.append((a, pv.get(), sk, sp, dv.get(), stv.get(), env.get()))
 
         if not messagebox.askyesno("Run batch",
                 f"Run {len(jobs)} job(s) across {len(self._batch_aois)} AOI(s)?\n\n"
@@ -5689,7 +6343,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 "AOIs run sequentially — use STOP to halt after the current one."):
             return
 
-        _save_config({"batch_out": out_base})
+        self._save_batch_state()
 
         # begin run state (mirrors _on_start)
         self._running = True
@@ -5721,15 +6375,23 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
     def _batch_worker(self, jobs, out_base, set_proc):
         ok_all = True
         total = len(jobs)
-        for idx, (aoi, preset, speckle) in enumerate(jobs, 1):
+        # track completion per AOI so fully-finished AOIs can drop off the saved batch
+        jobs_per_aoi = {}
+        for j in jobs:
+            jobs_per_aoi[j[0]] = jobs_per_aoi.get(j[0], 0) + 1
+        ok_per_aoi = {a: 0 for a in jobs_per_aoi}
+        for idx, (aoi, preset, speckle, speckle_params, dem, start, end) in enumerate(jobs, 1):
             if self._stop_event.is_set():
                 self._log(f"\n[Batch stopped — {idx-1}/{total} job(s) completed]")
                 break
-            label = f"{Path(aoi).stem} · {preset}" + ("" if speckle == "none" else f"/{speckle}")
+            spk_lbl = (speckle_params.get("filter") if speckle == "custom" and speckle_params
+                       else speckle)
+            label = f"{Path(aoi).stem} · {preset}" + ("" if speckle == "none" else f"/{spk_lbl}") + f" · {dem}"
             self._log("\n" + "#" * 62)
-            self._log(f"# BATCH {idx}/{total}:  {label}")
+            self._log(f"# BATCH {idx}/{total}:  {label}  [{start} → {end}]")
             self._log("#" * 62)
-            cfg = self._batch_cfg(aoi, preset, speckle, out_base)
+            cfg = self._batch_cfg(aoi, preset, speckle, out_base, start, end,
+                                  speckle_params=speckle_params, dem=dem)
             cfg["stop_event"]  = self._stop_event
             cfg["force_event"] = self._force_event
             cfg["set_proc_cb"] = set_proc
@@ -5743,10 +6405,26 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                              self._update_progress)
             except Exception as e:
                 self._log(f"[BATCH job error] {e}")
-            if not _res["ok"]:
+            if _res["ok"]:
+                ok_per_aoi[aoi] += 1
+            else:
                 ok_all = False
             self.after(0, self._reset_all_progress)
+        # prune AOIs whose every job finished ok; keep partial/unrun ones for resume
+        finished = {a for a, n in jobs_per_aoi.items() if ok_per_aoi.get(a, 0) == n}
+        if finished:
+            self.after(0, lambda f=finished: self._batch_prune_finished(f))
         self._on_done(ok_all)
+
+    def _batch_prune_finished(self, finished):
+        remaining = [a for a in self._batch_aois if a not in finished]
+        if remaining == self._batch_aois:
+            return
+        self._batch_aois = remaining
+        self._refresh_batch_listbox()
+        self._save_batch_state()
+        self._log(f"[Batch] {len(finished)} finished AOI(s) removed from the saved batch; "
+                  f"{len(remaining)} remain.")
 
     def _on_start(self, retry_dates=None):
         if self._running:
@@ -5836,9 +6514,10 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
 
         # if using existing .SAFE folder, override safe_dir and force skip download
         using_existing      = self.v_safe_source.get() == "existing"
+        using_existing_zip  = self.v_safe_source.get() == "existing_zip"
         using_existing_snap = self.v_safe_source.get() == "existing_snap"
 
-        if using_existing:
+        if using_existing or using_existing_zip:
             existing_path = self.v_existing_safe.get().strip()
             if not existing_path:
                 existing_path = self.v_safe_dir.get().strip()
@@ -5883,6 +6562,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "end_date":       self.v_end.get(),
             "output_crs":     self.v_crs.get(),
             "safe_dir":       self.v_safe_dir.get(),
+            "safe_out_dir":   self.v_safe_out_dir.get(),
+            "safe_scratch_gb": self.v_safe_scratch_gb.get(),
             "snap_dir":       self.v_snap_dir.get(),
             "out_dir":        self.v_out_dir.get(),
             "graph_preset":   self.v_graph_preset.get(),
@@ -5899,6 +6580,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "s3_workers":        int(self.v_s3_workers.get()),
             "satellites":        [s for s, v in self.v_sat.items() if v.get()] or ["S1A", "S1B", "S1C"],
             "unzip_workers":     int(self.v_unzip_workers.get()),
+            "unzip_stage_dir":   self._unzip_stage_cfg(),
             "max_idx_workers":   int(self.v_idx_workers.get()),
             "max_snap_workers":  int(self.v_snap_workers.get()),
             "jvm_mb":            int(self.v_jvm_mb.get()),
@@ -5929,7 +6611,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "cdse_pass":   self.v_cdse_pass.get(),
             "s3_access":   self.v_s3_access.get(),
             "s3_secret":   self.v_s3_secret.get(),
-            "do_download": False if (using_existing or using_existing_snap) else self.v_do_dl.get(),
+            "do_download": False if (using_existing or using_existing_zip or using_existing_snap) else self.v_do_dl.get(),
             "do_snap":     False if using_existing_snap else self.v_do_snap.get(),
             "do_indices":  self.v_do_indices.get(),
             "clean_snap":  self.v_clean_snap.get(),
@@ -5941,7 +6623,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 if en.get() and n.get().strip() and e.get().strip()
             ],
             "scales":      scales,
-            "safe_dir":    existing_path if using_existing else self.v_safe_dir.get(),
+            "safe_dir":    existing_path if (using_existing or using_existing_zip) else self.v_safe_dir.get(),
+            "safe_out_dir": "" if using_existing else self.v_safe_out_dir.get(),
+            "safe_scratch_gb": self.v_safe_scratch_gb.get(),
             "snap_dir":    existing_snap_path if using_existing_snap else self.v_snap_dir.get(),
             "out_dir":     self.v_out_dir.get(),
             "gpt_path":    self.v_gpt.get(),
@@ -5958,6 +6642,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "max_dl_workers":    int(self.v_dl_workers.get()),
             "s3_workers":        int(self.v_s3_workers.get()),
             "unzip_workers":     int(self.v_unzip_workers.get()),
+            "unzip_stage_dir":   self._unzip_stage_cfg(),
             "max_idx_workers":   int(self.v_idx_workers.get()),
             "max_snap_workers":  int(self.v_snap_workers.get()),
             "jvm_mb":            int(self.v_jvm_mb.get()),
