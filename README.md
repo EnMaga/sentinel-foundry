@@ -312,6 +312,24 @@ For large jobs whose full set of `.SAFE` products won't fit on the working drive
 
 ---
 
+### Multiple-AOI batch runner
+
+The **Batch** tab processes **many AOIs in one sequential run** — each AOI (and each pipeline variant) gets its own auto-named output folder, and AOIs run one after another.
+
+1. **AOI files** (section 1) — add `.geojson` / `.shp` / `.gpkg` files individually or a whole folder. The list is saved on Run, so it reappears next launch; finished AOIs drop off automatically and unfinished ones stay and resume from disk.
+2. **Pipeline assignment** (section 2) — three modes:
+   - **Uniform** — the same pipeline + speckle filter + DEM for every AOI.
+   - **All combinations** — every AOI × selected pipelines × speckles × DEMs (one output set per combination).
+   - **Per-AOI** — choose pipeline, speckle, DEM and date range individually for each AOI (one row each).
+3. **Common settings** (section 3) — output bands and worker counts (unzip / SNAP jobs / index) are **shared across all AOIs** and bound to the same controls as the Download/Processing tabs, so you set them once. Source, credentials, satellites, orbit and scale (dB/linear) also come from those tabs.
+4. **Output base** (section 4) — outputs go to `<base>/<AOI>/<pipeline_speckle_DEM>/`; each AOI's downloads live in `<base>/<AOI>/_safe/`.
+
+Press **▶ Run Batch**. **Stop** halts after the current scene (partial downloads are kept), and finished AOIs are skipped on a re-run.
+
+> **Note — the batch runner does *not* use the single-AOI disk budget.** `safe_scratch_gb` / `safe_out_dir` (above) apply only to a normal single-AOI run. In multi-AOI mode each AOI extracts **all** of its `.SAFE` at once into `<base>/<AOI>/_safe/` and keeps them (so the AOI's pipeline/speckle/DEM combinations can reuse one download) — so `<base>` must have room for a full AOI's `.SAFE`. For extract→SNAP→delete chunking on a very large AOI, run that AOI on its own from the main SAR tab instead.
+
+---
+
 ### Stop button
 
 Pressing **■ STOP** once is **graceful**: it stops launching new scenes — and, in batch mode, new batches — but lets the SNAP run(s) already in flight finish and publish, so you never lose minutes of compute or leave a half-done group. Scenes that finished are still turned into COG indices and their raw `.SAFE` cleaned; scenes not yet converted keep their `.SAFE` so a re-run resumes them. **Press STOP a second time to force-kill** the running SNAP GPT subprocess(es) (`Popen.kill()`) and abort any in-flight download immediately. The UI resets to ready state.
@@ -585,6 +603,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 - **One-click builds** — Windows, macOS and Linux builds are on the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases) (macOS/Linux not yet field-tested — feedback welcome). Python, SNAP and GDAL remain external prerequisites.
 - ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
 - ~~**Batch disk budget + incremental per-batch output (S1)**~~ *(done — section 2e; extract → SNAP → index → delete per chunk, COG indices produced per batch, resume-safe `.SAFE` delete, elapsed/ETA per batch, RAM-aware SNAP-worker default; see "Batch disk budget & incremental output")*
+- ~~**Multiple-AOI batch runner (S1)**~~ *(done — Batch tab; process many AOIs sequentially with uniform / all-combinations / per-AOI pipeline assignment; see "Multiple-AOI batch runner")*
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*
