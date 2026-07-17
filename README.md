@@ -318,15 +318,15 @@ The **Batch** tab processes **many AOIs in one sequential run** — each AOI (an
 
 1. **AOI files** (section 1) — add `.geojson` / `.shp` / `.gpkg` files individually or a whole folder. The list is saved on Run, so it reappears next launch; finished AOIs drop off automatically and unfinished ones stay and resume from disk.
 2. **Pipeline assignment** (section 2) — three modes:
-   - **Uniform** — the same pipeline + speckle filter + DEM for every AOI.
-   - **All combinations** — every AOI × selected pipelines × speckles × DEMs (one output set per combination).
-   - **Per-AOI** — choose pipeline, speckle, DEM and date range individually for each AOI (one row each).
+   - **Uniform** — one pipeline + speckle filter + DEM applied to *every* AOI. Use it to produce the same product across many study sites. **Jobs = number of AOIs** (one each).
+   - **All combinations** — a full grid: every AOI × every ticked pipeline (Sigma0 / Gamma0) × every ticked speckle filter × every ticked DEM. Each combination is a separate job with its own output folder, so you can compare preprocessing choices side by side for the same site. **Jobs = AOIs × pipelines × speckles × DEMs** — this multiplies quickly, so tick deliberately. All combinations of a given AOI reuse a single download (see disk-budget note below).
+   - **Per-AOI** — one row per AOI where you pick its pipeline, speckle, DEM **and its own date range** independently (📅 picker per row; *Apply row 1's dates to all* fills the rest). Use it when sites differ in season, orbit, or desired product. **Jobs = number of AOIs** (one each).
 3. **Common settings** (section 3) — output bands and worker counts (unzip / SNAP jobs / index) are **shared across all AOIs** and bound to the same controls as the Download/Processing tabs, so you set them once. Source, credentials, satellites, orbit and scale (dB/linear) also come from those tabs.
-4. **Output base** (section 4) — outputs go to `<base>/<AOI>/<pipeline_speckle_DEM>/`; each AOI's downloads live in `<base>/<AOI>/_safe/`.
+4. **Output base** (section 4) — outputs go to `<base>/<AOI>/<pipeline_speckle_DEM>/`; each AOI's downloads and extraction live under `<base>/<AOI>/_safe/`.
 
 Press **▶ Run Batch**. **Stop** halts after the current scene (partial downloads are kept), and finished AOIs are skipped on a re-run.
 
-> **Note — the batch runner does *not* use the single-AOI disk budget.** `safe_scratch_gb` / `safe_out_dir` (above) apply only to a normal single-AOI run. In multi-AOI mode each AOI extracts **all** of its `.SAFE` at once into `<base>/<AOI>/_safe/` and keeps them (so the AOI's pipeline/speckle/DEM combinations can reuse one download) — so `<base>` must have room for a full AOI's `.SAFE`. For extract→SNAP→delete chunking on a very large AOI, run that AOI on its own from the main SAR tab instead.
+> **Disk budget applies in batch mode too.** Set the section-2e **disk budget** (`safe_scratch_gb`) and each AOI is processed in chunks — extract ≤ budget GB of `.SAFE` → SNAP → index → delete — so no more than one budget's worth of `.SAFE` is ever on disk at once (same as a single-AOI run). An AOI that runs **multiple combinations** keeps its downloaded `.zip`s so each combination re-extracts chunks **without re-downloading**; a **single-combination** AOI (Uniform / Per-AOI) deletes each `.zip` as it is extracted to free space. Leave the budget blank / `0` to extract everything at once (old behaviour).
 
 ---
 
@@ -603,7 +603,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 - **One-click builds** — Windows, macOS and Linux builds are on the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases) (macOS/Linux not yet field-tested — feedback welcome). Python, SNAP and GDAL remain external prerequisites.
 - ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
 - ~~**Batch disk budget + incremental per-batch output (S1)**~~ *(done — section 2e; extract → SNAP → index → delete per chunk, COG indices produced per batch, resume-safe `.SAFE` delete, elapsed/ETA per batch, RAM-aware SNAP-worker default; see "Batch disk budget & incremental output")*
-- ~~**Multiple-AOI batch runner (S1)**~~ *(done — Batch tab; process many AOIs sequentially with uniform / all-combinations / per-AOI pipeline assignment; see "Multiple-AOI batch runner")*
+- ~~**Multiple-AOI batch runner (S1)**~~ *(done — Batch tab; process many AOIs sequentially with uniform / all-combinations / per-AOI pipeline assignment; now honours the section-2e disk budget per AOI, keeping zips for multi-combo AOIs so combinations don't re-download; see "Multiple-AOI batch runner")*
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*

@@ -9,7 +9,7 @@ authors:
     orcid: "https://orcid.org/0009-0005-5563-9391"
 license: MIT
 repository-code: "https://github.com/EnMaga/sentinel-foundry"
-version: 1.0.10
+version: 1.0.11
 date-released: 2026-07-17
 keywords:
   - Sentinel-1

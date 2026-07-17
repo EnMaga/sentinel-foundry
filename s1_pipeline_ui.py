@@ -2237,8 +2237,9 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
             progress_cb("unzip", _d, n_zip, msg)
 
         if os.path.isdir(safe_path):
-            try: os.remove(zp)
-            except Exception: pass
+            if not cfg.get("keep_zips"):
+                try: os.remove(zp)
+                except Exception: pass
             _tick(f"{stem[:28]}  skip"); return
 
         # ── pre-unzip check (fast — reads only the zip's central directory) ──
@@ -2323,10 +2324,11 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
             elif _st2 == "SUSPECT":
                 log(f"    ⚠ {stem}.SAFE: {'; '.join(_why2)} — kept, inspect later")
 
-        try:
-            os.remove(zp); log(f"    Deleted:  {Path(zp).name}")
-        except Exception:
-            pass
+        if not cfg.get("keep_zips"):
+            try:
+                os.remove(zp); log(f"    Deleted:  {Path(zp).name}")
+            except Exception:
+                pass
         _tick(f"{stem[:28]}  ✓")
 
     # Seed the progress history at current=0 so the ETA has a time base as soon
@@ -6392,6 +6394,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             self._log("#" * 62)
             cfg = self._batch_cfg(aoi, preset, speckle, out_base, start, end,
                                   speckle_params=speckle_params, dem=dem)
+            # Disk-budget chunking applies in batch mode too (section 2e budget):
+            # cap how much .SAFE sits on disk per AOI. An AOI with multiple
+            # pipeline/speckle/DEM combos keeps its zips so each combo re-extracts
+            # chunks without re-downloading; a single-combo AOI deletes zips as it
+            # goes to free space.
+            cfg["safe_scratch_gb"] = self.v_safe_scratch_gb.get()
+            cfg["keep_zips"] = jobs_per_aoi.get(aoi, 1) > 1
             cfg["stop_event"]  = self._stop_event
             cfg["force_event"] = self._force_event
             cfg["set_proc_cb"] = set_proc
