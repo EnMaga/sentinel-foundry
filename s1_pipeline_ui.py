@@ -85,6 +85,10 @@ import os as _os, tempfile as _tempfile
 _GDAL_LOG = _os.path.join(_tempfile.gettempdir(), "sar_foundry_gdal.log")
 _os.environ.setdefault("CPL_LOG", _GDAL_LOG)
 _os.environ.setdefault("CPL_LOG_ERRORS", "ON")   # keep messages, just not in terminal
+# Tee every UI log line to a temp file so a run can be watched/tailed live from
+# outside the app (pythonw has no console). Best-effort, thread-safe.
+_RUN_LOG = _os.path.join(_tempfile.gettempdir(), "sar_foundry_run.log")
+_RUN_LOG_LOCK = threading.Lock()
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -432,6 +436,37 @@ def _clear_error(cfg, stem, phase):
         pass
 
 
+def _final_exists(out_dir, name):
+    """True if a final product for this scene's acquisition date+orbit already
+    exists under out_dir (any cluster/band). Finals are named
+    S1_<YYYYMMDD>_…_<ASC|DSC>_<band>.tif in out_dir's ASC/DSC subfolders.
+
+    Orbit is derived from the acquisition hour exactly as finals are named
+    (_parse_safe_name: hour ≥ 12 → ASC), NOT from flightDirection, so the label
+    always matches. Used by 'download missing dates' to skip scenes whose date is
+    already finished. Enabled only when cfg['skip_if_final'] is set."""
+    if not out_dir:
+        return False
+    m = re.search(r'_(\d{8})T(\d{2})', name)
+    if not m:
+        return False
+    date, hr = m.group(1), int(m.group(2))
+    orbit = "ASC" if hr >= 12 else "DSC"
+    return bool(glob.glob(os.path.join(out_dir, "**", f"S1_{date}_*_{orbit}_*.tif"),
+                          recursive=True))
+
+
+def _already_have(cfg, name):
+    """True if this scene's date+orbit already exists at ANY processed stage —
+    a SNAP GeoTIFF (snap_dir) or a final product (out_dir). Both are named
+    S1_<date>_..._<ASC|DSC>_*.tif, so one check covers each. (.SAFE/zip presence
+    is checked separately at each download site.) Used by 'download missing dates'
+    so a date already downloaded OR processed anywhere is skipped — only dates
+    truly absent from all folders get re-downloaded from the catalogue."""
+    return (_final_exists(cfg.get("out_dir", ""), name)
+            or _final_exists(cfg.get("snap_dir", ""), name))
+
+
 def _pending_index_error(cfg, date, orbit):
     """True if a previous run left an unresolved indices error for this
     date/orbit, so it must be reprocessed rather than skipped."""
@@ -501,6 +536,10 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
     if progress_cb is None:
         progress_cb = lambda phase, cur, tot, lbl="": None
     try:
+        try:                                  # fresh run log for live tailing
+            open(_RUN_LOG, "w").close()
+        except Exception:
+            pass
         log("="*60)
         log(f"Pipeline started  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         log("="*60)
@@ -515,6 +554,35 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             log("  ⚠ CDSE S3 delivers .SAFE directly — '.SAFE unzip folder' ignored "
                 "(using the download folder).")
             safe_out = safe_dir
+        # Existing-.SAFE mode: the .SAFE already sit in safe_dir (the folder the
+        # user pointed at) and nothing is extracted, so SNAP must read safe_dir.
+        # The '.SAFE unzip folder' (safe_out) only holds .SAFE when we actually
+        # unzip (download / existing-zip). Without this, a set unzip folder sent
+        # SNAP to the empty extraction target → "Processing 0 .SAFE files".
+        if (not cfg.get("do_download") and safe_out != safe_dir
+                and glob.glob(os.path.join(safe_dir, "*.SAFE"))):
+            log(f"  Existing .SAFE found in {safe_dir} → SNAP reads there "
+                f"('.SAFE unzip folder' applies only when unzipping).")
+            safe_out = safe_dir
+        # Startup diagnostic: state the resolved .SAFE extraction target up front
+        # and WARN loudly when it falls back to the zip folder (blank unzip
+        # folder) — extracting onto a slow/external zip drive is the usual cause
+        # of "unzip suddenly got slow".
+        _raw_out = (cfg.get("safe_out_dir") or "").strip()
+        _sd_drv = os.path.splitdrive(os.path.abspath(safe_dir))[0] or safe_dir
+        _so_drv = os.path.splitdrive(os.path.abspath(safe_out))[0] or safe_out
+        if not _raw_out:
+            log(f"  ⚠ '.SAFE unzip folder' is BLANK → .SAFE extract INTO the zip folder "
+                f"{safe_dir} ({_sd_drv}). If that drive is slow/external, set section 2e's "
+                f"'.SAFE unzip folder' to a fast drive (e.g. C:) to speed unzip.")
+        elif os.path.abspath(safe_out) == os.path.abspath(safe_dir):
+            # Field IS set, but to the same folder as the zips (blank ≠ this case).
+            log(f"  .SAFE unzip folder = the zip folder → .SAFE extract INTO {safe_dir} "
+                f"({_sd_drv}). Point it at a different fast drive to split zip reads "
+                f"from extraction writes.")
+        else:
+            log(f"  .SAFE extraction target → {safe_out} ({_so_drv})   |   zips read from "
+                f"{safe_dir} ({_sd_drv})")
         # Wait for every drive this run reads/writes (download, extract, SNAP,
         # finals) to be online before touching them — an external drive may be
         # reconnecting; don't fail makedirs on a transient drop.
@@ -524,8 +592,7 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         os.makedirs(snap_dir,  exist_ok=True)
         os.makedirs(out_dir,   exist_ok=True)
         os.makedirs(safe_out,  exist_ok=True)
-        if safe_out != safe_dir:
-            log(f"  .SAFE output → {safe_out}   (zips read from {safe_dir})")
+        # (the resolved .SAFE target is already reported by the startup diagnostic above)
 
         # Optional batching: cap how much .SAFE sits on disk at once by processing in
         # chunks (extract → SNAP → delete, repeat) so a small/slow output drive never
@@ -541,9 +608,14 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         # removed first — they fail SNAP and block re-download/unzip otherwise.
         _broken_safes = _prune_broken_safes(safe_out, log)
         failed_downloads = []
-        if cfg["do_download"]:
+        # Pipelined mode: overlap downloading with batch processing so batch N+1's
+        # zips are pre-fetched while batch N runs. Needs batching AND an active
+        # download; the download+process both happen in step 2 below. Existing-file
+        # and non-batch runs keep the old sequential download-then-process flow.
+        _overlap = _batching and cfg["do_download"]
+        if cfg["do_download"] and not _overlap:
             failed_downloads = _download_dispatch(cfg, safe_dir, log, progress_cb)
-        else:
+        elif not cfg["do_download"]:
             log("\n── STEP 1: Skipped (use existing .SAFE files) ──")
             _stop_ev = cfg.get("stop_event")
             # Re-fetch any broken products so a single corrupt download doesn't
@@ -569,7 +641,13 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
             done_cb(False); return
 
         # ── step 2: SNAP processing ───────────────────────────────────────
-        if _batching:
+        if _overlap:
+            log("\n── STEP 1+2: Pipelined  download → extract → SNAP → delete  (overlapped) ──")
+            failed_downloads = _process_in_batches(
+                cfg, safe_dir, safe_out, snap_dir, _batch_gb,
+                log, progress_cb, cfg.get("stop_event"), overlap=True)
+            cfg.pop("_batch_defer", None)   # done downloading — let retry-pass unzip run
+        elif _batching:
             cfg.pop("_batch_defer", None)
             log("\n── STEP 1b+2: Batched  extract → SNAP → delete .SAFE  (per chunk) ──")
             _process_in_batches(cfg, safe_dir, safe_out, snap_dir, _batch_gb,
@@ -922,10 +1000,14 @@ def _download(cfg, safe_dir, log, progress_cb=None):
             safe_path = os.path.join((cfg.get("safe_out_dir") or "").strip() or safe_dir, name + ".SAFE")
             zip_path  = os.path.join(safe_dir, name + ".zip")
 
-            # skip if already extracted or zip already present
-            if os.path.isdir(safe_path) or os.path.isfile(zip_path):
+            # skip if already extracted, zip present, or (fill-missing mode) a
+            # final product for this date+orbit already exists
+            _skip_final = (not (os.path.isdir(safe_path) or os.path.isfile(zip_path))
+                           and cfg.get("skip_if_final")
+                           and _already_have(cfg, name))
+            if os.path.isdir(safe_path) or os.path.isfile(zip_path) or _skip_final:
                 dl_done += 1
-                log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  (exists)")
+                log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  ({'already processed' if _skip_final else 'exists'})")
                 progress_cb("download", dl_done, n_dl, f"{date} {dirn}  skip")
                 continue
 
@@ -944,6 +1026,8 @@ def _download(cfg, safe_dir, log, progress_cb=None):
                             speed=spd_str)
                 log(f"     ✓  {elapsed:.0f}s  {delta_mb:.0f} MB  {spd_str}")
                 _clear_error(cfg, name, "download")   # recovered — drop stale log
+                _or = cfg.get("_on_ready")            # pipelined mode: hand the
+                if _or: _or(zip_path)                 # finished zip to the consumer
             else:
                 _write_error(cfg, name, "download", f"{_dl_err}")
                 log(f"     ✗ ERROR after retries: {_dl_err}")
@@ -1192,10 +1276,13 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
         safe_path = os.path.join((cfg.get("safe_out_dir") or "").strip() or safe_dir, base + ".SAFE")
         zip_path  = os.path.join(safe_dir, base + ".zip")
 
-        if os.path.isdir(safe_path) or os.path.isfile(zip_path):
+        _skip_final = (not (os.path.isdir(safe_path) or os.path.isfile(zip_path))
+                       and cfg.get("skip_if_final")
+                       and _already_have(cfg, name))
+        if os.path.isdir(safe_path) or os.path.isfile(zip_path) or _skip_final:
             with _lock:
                 dl_done += 1; _c = dl_done
-            log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  (exists)")
+            log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  ({'already processed' if _skip_final else 'exists'})")
             progress_cb("download", _c, n_dl, f"{date} {dirn}  skip")
             return None
 
@@ -1305,6 +1392,8 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                 log(f"     ✓  {elapsed:.0f}s  {mb:.0f} MB  {spd_str}"
                     + ("  (resumed)" if resume_from > 0 else ""))
                 _clear_error(cfg, name, "download_cdse")   # recovered — drop stale log
+                _or = cfg.get("_on_ready")            # pipelined mode: hand the
+                if _or: _or(zip_path)                 # finished zip to the consumer
                 return None
 
             except Exception as _dl_err:
@@ -1416,9 +1505,12 @@ def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
 
         safe_path = os.path.join(safe_dir, base + ".SAFE")
         zip_path  = os.path.join(safe_dir, base + ".zip")
-        if os.path.isdir(safe_path) or os.path.isfile(zip_path):
+        _skip_final = (not (os.path.isdir(safe_path) or os.path.isfile(zip_path))
+                       and cfg.get("skip_if_final")
+                       and _already_have(cfg, name))
+        if os.path.isdir(safe_path) or os.path.isfile(zip_path) or _skip_final:
             with _lock: _done[0] += 1; _c = _done[0]
-            log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  (exists)")
+            log(f"  [{i}/{n_dl}] SKIP {date} {dirn}  ({'already processed' if _skip_final else 'exists'})")
             progress_cb("download", _c, n_dl, f"{date} {dirn}  skip")
             return
 
@@ -1499,6 +1591,8 @@ def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
             log(f"     ✓  {base[:28]}  {elapsed:.0f}s  {mb:.0f} MB  {spd}")
             _clear_error(cfg, name, "download_s3")
             progress_cb("download", _c, n_dl, f"{date} {dirn} ✓ {mb:.0f}MB {spd}", speed=spd)
+            _or = cfg.get("_on_ready")            # pipelined mode: hand the finished
+            if _or: _or(safe_path)                # .SAFE (S3 delivers extracted) over
 
         except Exception as e:
             _write_error(cfg, name, "download_s3", f"{e}")
@@ -2125,10 +2219,200 @@ def _fmt_dur(sec):
     return f"{m:.1f} min" if m < 60 else f"{int(m // 60)}h {int(round(m % 60))}m"
 
 
-def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_cb, stop_ev):
+_SAFE_EST = 1.7   # .SAFE ≈ 1.7× its zip on disk (measured on GRDH)
+
+
+class _ReadyBudget:
+    """Producer/consumer handoff for pipelined download → process, with a disk
+    budget. Download workers call add() once a product is fully on disk; the
+    batch consumer pulls chunks via take_chunk() and calls free() after deleting
+    a chunk's .SAFE. add() BLOCKS the worker while the download folder already
+    holds ~budget of un-processed product (zips counted at their .SAFE size, so
+    the accounting covers zips-in-flight + .SAFE-in-flight together) — that's the
+    backpressure that stops the (fast) download drive from overfilling.
+    Thread-safe: CDSE/S3 download several scenes at once."""
+
+    def __init__(self, budget_bytes, stop_ev):
+        self.budget = max(budget_bytes, 1)
+        self.stop = stop_ev
+        self.cv = threading.Condition()
+        self.ready = []       # [(path, footprint)] finished, not yet consumed
+        self.pending = 0      # footprint of downloaded-but-not-cleaned product
+        self.finished = False
+        self.seen = set()
+
+    def _stopped(self):
+        return self.stop is not None and self.stop.is_set()
+
+    @staticmethod
+    def _footprint(path):
+        """Bytes this product will occupy on disk once extracted: a .zip counts
+        at its eventual .SAFE size (× _SAFE_EST); an already-extracted .SAFE dir
+        (S3 / resume) counts at its real size."""
+        try:
+            if str(path).lower().endswith(".zip") and os.path.isfile(path):
+                return os.path.getsize(path) * _SAFE_EST
+            if os.path.isdir(path):
+                return sum(e.stat().st_size for e in os.scandir(path)
+                           if e.is_file(follow_symlinks=False))
+        except OSError:
+            pass
+        return 0.0
+
+    def _record(self, path):
+        if path in self.seen:
+            return 0.0
+        self.seen.add(path)
+        fp = self._footprint(path)
+        self.ready.append((path, fp))
+        self.pending += fp
+        return fp
+
+    def seed(self, path):
+        """Register a product already on disk (a resumed run) without blocking —
+        the downloaders skip re-fetching it, so nothing else would hand it over."""
+        with self.cv:
+            self._record(path)
+            self.cv.notify_all()
+
+    def add(self, path):
+        """Called by a download worker when `path` is fully written. Hands it to
+        the consumer, then blocks the worker while the folder is full."""
+        with self.cv:
+            self._record(path)
+            self.cv.notify_all()
+            while self.pending >= self.budget and not self._stopped() and not self.finished:
+                self.cv.wait(timeout=1.0)
+
+    def done(self):
+        """Producer finished — let the consumer drain and exit."""
+        with self.cv:
+            self.finished = True
+            self.cv.notify_all()
+
+    def take_chunk(self, chunk_budget):
+        """Block until ≥1 product is ready (or the producer is done/stopped), then
+        return products totalling ≤ chunk_budget (always ≥1 so a lone oversized
+        scene still moves). Returns [] only when fully drained."""
+        with self.cv:
+            while not self.ready and not self.finished and not self._stopped():
+                self.cv.wait(timeout=1.0)
+            chunk, sz = [], 0.0
+            while self.ready:
+                p, fp = self.ready[0]
+                if chunk and sz + fp > chunk_budget:
+                    break
+                self.ready.pop(0); chunk.append((p, fp)); sz += fp
+            return chunk
+
+    def free(self, footprint):
+        """Consumer freed `footprint` bytes (chunk's .SAFE deleted) — unblock the
+        producer so it can pre-fetch the next batch."""
+        with self.cv:
+            self.pending -= footprint
+            self.cv.notify_all()
+
+
+def _process_one_chunk(cfg, paths, safe_dir, safe_out, snap_dir, log, progress_cb, stop_ev):
+    """Extract (zips) → SNAP → indices → delete .SAFE for one chunk of products.
+    `paths` may be .zip files (extracted first) and/or already-extracted .SAFE
+    dirs (S3 / resume — SNAP picks those up directly). SNAP and indices scan the
+    whole output dir, so any leftover .SAFE from an interrupted run is swept in
+    too. Shared by the static batch loop and the pipelined (overlap) runner."""
+    if not _ensure_drives([safe_dir, safe_out, snap_dir, cfg.get("out_dir")], log, stop_ev):
+        return
+    zips = [p for p in paths if str(p).lower().endswith(".zip") and os.path.isfile(p)]
+    if zips:
+        _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=zips)
+    if cfg.get("do_snap"):
+        _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
+        # Finals per batch (see the static loop's note): _compute_indices scans
+        # the whole snap_dir, then _clean_safe frees this chunk's .SAFE.
+        if cfg.get("do_indices"):
+            _compute_indices(cfg, snap_dir, cfg.get("out_dir", ""), log, progress_cb)
+        _clean_safe(safe_out, log, snap_dir, cfg)
+
+
+def _run_pipelined(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_cb, stop_ev):
+    """Overlap downloading with batch processing: a background thread downloads
+    products (producer) while this thread extracts → SNAP → deletes them in
+    chunks (consumer). _ReadyBudget backpressure keeps zips + .SAFE on disk ≤
+    budget_gb, so the next batch's zips are pre-fetched onto the fast download
+    drive while the current batch runs, without ever overfilling it. Returns the
+    producer's failed-download list (for the ASF retry pass).
+
+    ponytail: backpressure is applied *after* each download completes, so with C
+    parallel download workers (CDSE/S3) peak disk may briefly exceed the budget by
+    up to C scenes — lower the download/unzip workers or raise safe_scratch_gb if
+    the drive is tight. ASF downloads one scene at a time, so it stays exact."""
+    budget_bytes = budget_gb * (1024 ** 3)
+    gate = _ReadyBudget(budget_bytes, stop_ev)
+    # Seed products already on disk from a previous run — the downloaders skip
+    # re-fetching them and so would never hand them over otherwise.
+    for z in sorted(glob.glob(os.path.join(safe_dir, "*.zip"))):
+        gate.seed(z)
+    for s in sorted(glob.glob(os.path.join(safe_out, "*.SAFE"))):
+        gate.seed(s)
+
+    result = {}
+    def _producer():
+        try:
+            cfg["_on_ready"] = gate.add
+            result["failed"] = _download_dispatch(cfg, safe_dir, log, progress_cb) or []
+        except Exception as e:
+            import traceback as _tb
+            result["error"] = e
+            log(f"  ⚠ download thread failed: {e}")
+            log(_tb.format_exc())
+        finally:
+            cfg.pop("_on_ready", None)
+            gate.done()   # always release the consumer, even on error/stop
+
+    prod = threading.Thread(target=_producer, name="sf-downloader", daemon=True)
+    prod.start()
+
+    # Half the budget for the batch in flight, half to pre-fetch the next one.
+    chunk_budget = max(budget_bytes * 0.5, 1)
+    _n = 0
+    _t0 = time.time()
+    while True:
+        chunk = gate.take_chunk(chunk_budget)
+        if not chunk:
+            break                       # producer done and drained (or stopped)
+        if stop_ev and stop_ev.is_set():
+            gate.free(sum(fp for _, fp in chunk))   # unblock producer so it exits
+            log(f"  [Stopped at batch boundary — halted before batch {_n + 1}]")
+            break
+        _n += 1
+        _gb = sum(fp for _, fp in chunk) / (1024 ** 3)
+        log(f"\n── Batch {_n}: {len(chunk)} scene(s), ~{_gb:.1f} GB .SAFE (pipelined) ──")
+        try:
+            _process_one_chunk(cfg, [p for p, _ in chunk], safe_dir, safe_out,
+                               snap_dir, log, progress_cb, stop_ev)
+        finally:
+            gate.free(sum(fp for _, fp in chunk))   # MUST free or producer deadlocks
+        log(f"  ⏱ Batch {_n} done — {_fmt_dur(time.time() - _t0)} elapsed")
+        if stop_ev and stop_ev.is_set():
+            log(f"  [Stopped — finished batch {_n}; halting before next]")
+            break
+
+    prod.join()
+    if result.get("error"):
+        raise result["error"]
+    return result.get("failed", [])
+
+
+def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_cb, stop_ev,
+                        overlap=False):
     """Extract → SNAP → delete .SAFE in chunks so no more than ~budget_gb of .SAFE
     exist at once — keeps a small/slow output drive from filling. .SAFE ≈ 1.7× its
-    zip (measured on GRDH). Each chunk's .SAFE is deleted after SNAP, before the next."""
+    zip (measured on GRDH). Each chunk's .SAFE is deleted after SNAP, before the next.
+
+    overlap=True runs the pipelined variant instead: download and process overlap,
+    so batch N+1's zips are pre-fetched while batch N runs (see _run_pipelined)."""
+    if overlap:
+        return _run_pipelined(cfg, safe_dir, safe_out, snap_dir, budget_gb,
+                              log, progress_cb, stop_ev)
     _EST = 1.7
     zips = sorted(glob.glob(os.path.join(safe_dir, "*.zip")))
     if not zips:
@@ -2158,41 +2442,30 @@ def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progr
     for i, chunk in enumerate(chunks, 1):
         if stop_ev and stop_ev.is_set():
             log(f"  [Stopped at batch boundary — halted before batch {i}/{_total}]"); return
-        # Before each batch, make sure EVERY drive this batch touches is online —
-        # zips (safe_dir), extraction (safe_out), SNAP (snap_dir), finals (out_dir).
-        # If any external drive dropped out, wait for it to reconnect rather than
-        # failing scenes (returns False only if the user stops while waiting).
-        if not _ensure_drives([safe_dir, safe_out, snap_dir, cfg.get("out_dir")], log, stop_ev):
-            return
         _cgb = sum(os.path.getsize(z) for z in chunk if os.path.isfile(z)) * _EST / (1024**3)
         log(f"\n── Batch {i}/{_total}: {len(chunk)} scene(s), ~{_cgb:.0f} GB .SAFE ──")
-        _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=chunk)
-        if cfg.get("do_snap"):
-            _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
-            # Finals per batch: turn this batch's SNAP GeoTIFFs into the final
-            # product now. _compute_indices scans the WHOLE snap_dir, so it also
-            # sweeps up any GeoTIFFs left over from an earlier interrupted run —
-            # not just this batch's. Runs before _clean_safe so the .SAFE delete
-            # check sees either the D: tile or the final in out_dir.
-            if cfg.get("do_indices"):
-                _compute_indices(cfg, snap_dir, cfg.get("out_dir", ""), log, progress_cb)
-            # free this chunk's .SAFE — only the ones actually converted, so a
-            # stop/failure never drops a date.
-            _clean_safe(safe_out, log, snap_dir, cfg)
+        # Drive-online check, extract, SNAP, indices, and per-chunk .SAFE cleanup
+        # all happen in _process_one_chunk (shared with the pipelined runner).
+        _process_one_chunk(cfg, chunk, safe_dir, safe_out, snap_dir, log, progress_cb, stop_ev)
         _el = time.time() - _t0
         if i < _total:
             _eta = _el / i * (_total - i)
             log(f"  ⏱ Batch {i}/{_total} done — {_fmt_dur(_el)} elapsed, "
                 f"est. {_fmt_dur(_eta)} left ({_total - i} batch(es) to go)")
+            # mirror the same estimate to the UI, next to "Elapsed:"
+            progress_cb("__eta__", i, _total,
+                        f"~{_fmt_dur(_eta)} left ({_total - i} batch(es))")
         if stop_ev and stop_ev.is_set():
             log(f"  [Stopped — finished batch {i}/{_total}; halting before next]"); return
 
 
-def _rename_with_retry(src, dst, tries=6, delay=0.5):
+def _rename_with_retry(src, dst, tries=10, delay=0.5):
     """os.replace, retrying on Windows AccessDenied. Antivirus / Search indexer
     briefly locks freshly-extracted files, so an immediate same-volume rename can
     fail with WinError 5 even though nothing is wrong — a short backoff clears it.
-    ponytail: fixed retry schedule; if AV locks persist longer, raise `tries`."""
+    tries=10 → ~22 s of escalating backoff (a 6-try/~7 s budget was occasionally
+    exceeded by a slow AV scan, leaving a spurious 'move-failed' unzip error).
+    ponytail: fixed retry schedule; if AV locks persist even longer, raise `tries`."""
     import time as _t
     for i in range(tries):
         try:
@@ -2219,8 +2492,9 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
     pipeline will re-download whatever is missing.
     """
     import zipfile
-    if cfg.get("_batch_defer"):
-        return   # batch mode extracts in chunks itself (see _process_in_batches)
+    if cfg.get("_batch_defer") and only_zips is None:
+        return   # batch mode extracts in chunks itself (see _process_in_batches);
+                 # an explicit only_zips list is the batch consumer asking for it now
     zips = only_zips if only_zips is not None else glob.glob(os.path.join(safe_dir, "*.zip"))
     if not zips:
         return
@@ -2270,6 +2544,11 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
             if not cfg.get("keep_zips"):
                 try: os.remove(zp)
                 except Exception: pass
+            # .SAFE already in place = this scene is done; drop any stale unzip
+            # error from an earlier failed-then-recovered attempt so the summary
+            # doesn't keep re-reporting a scene that actually succeeded.
+            for _ph in ("unzip", "unzip_check", "download_check"):
+                _clear_error(cfg, stem, _ph)
             _tick(f"{stem[:28]}  skip"); return
 
         # ── pre-unzip check (fast — reads only the zip's central directory) ──
@@ -2360,6 +2639,11 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
                 os.remove(zp); log(f"    Deleted:  {Path(zp).name}")
             except Exception:
                 pass
+        # extraction + integrity checks passed — clear any stale unzip error so a
+        # scene that failed once (e.g. a transient AV lock on the rename) then
+        # recovered isn't falsely re-reported as an error on the next run.
+        for _ph in ("unzip", "unzip_check", "download_check"):
+            _clear_error(cfg, stem, _ph)
         _tick(f"{stem[:28]}  ✓")
 
     # Seed the progress history at current=0 so the ETA has a time base as soon
@@ -5241,7 +5525,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                     f"{_dates:<26}"
                     f"{str(h.get('orbit','?')):<7}"
                     f"{h.get('speckle','?')}")
-        self._btn(footer, "↻  Retry failed downloads", self._on_retry_failed,
+        self._btn(footer, "↻  Download missing / failed dates", self._on_retry_failed,
                   color=GOLD, font=(_FONT_FAM, 9, "bold"), pady=4
                   ).pack(fill=tk.X, padx=8, pady=(0, 2))
         self._btn(footer, "📋  Run history", _show_history,
@@ -5332,6 +5616,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._elapsed_var = tk.StringVar(value="")
         tk.Label(eta_row, textvariable=self._elapsed_var,
                  font=FONT_MONO, bg=SURFACE, fg=FG2, anchor="w").pack(side=tk.LEFT)
+        # total ETA (batch runs) sits right after Elapsed
+        tk.Label(eta_row, textvariable=self._eta_var,
+                 font=FONT_MONO, bg=SURFACE, fg=ACCENT_L, anchor="w").pack(side=tk.LEFT, padx=(6, 0))
 
         # overall indeterminate spinner (shows pipeline is running)
         self.progress = ttk.Progressbar(parent, mode="indeterminate")
@@ -5354,6 +5641,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
 
     def _update_progress(self, phase, current, total, label="", speed=""):
         def _do():
+            # Overall/total ETA channel (fed by the batch loop) — shown next to
+            # "Elapsed:" under the bars, not tied to any single phase bar.
+            if phase == "__eta__":
+                if hasattr(self, "_eta_var"):
+                    self._eta_var.set(f"·   Total ETA: {label}" if label else "")
+                return
             if not hasattr(self, "_prog_bars") or phase not in self._prog_bars:
                 return
             bar, cnt_var, stat_var = self._prog_bars[phase]
@@ -5386,6 +5679,10 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             if not hasattr(self, "_phase_hist"):
                 self._phase_hist = {}
             hist = self._phase_hist.setdefault(phase, [])
+            # A new batch restarts the "process" counter at 0; without clearing,
+            # the moving average mixes batches and dc goes negative → ETA blanks.
+            if hist and current < hist[-1][0]:
+                hist.clear()
             if not hist or hist[-1][0] != current:
                 hist.append((current, now))
             WIN = 10
@@ -5547,6 +5844,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
     # ── callbacks ─────────────────────────────────────────────────────────────
 
     def _log(self, text):
+        # Tee to the temp run log (best-effort) so a run can be watched live from
+        # outside the app. Written from the worker/download threads too → lock it.
+        try:
+            with _RUN_LOG_LOCK, open(_RUN_LOG, "a", encoding="utf-8") as _rl:
+                _rl.write(text + "\n")
+        except Exception:
+            pass
         def _append():
             self.log_box.configure(state=tk.NORMAL)
             tl = text.lower()
@@ -6466,7 +6770,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._log(f"[Batch] {len(finished)} finished AOI(s) removed from the saved batch; "
                   f"{len(remaining)} remain.")
 
-    def _on_start(self, retry_dates=None):
+    def _on_start(self, retry_dates=None, fill_missing=False):
         if self._running:
             return
 
@@ -6664,7 +6968,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             ],
             "scales":      scales,
             "safe_dir":    existing_path if (using_existing or using_existing_zip) else self.v_safe_dir.get(),
-            "safe_out_dir": "" if using_existing else self.v_safe_out_dir.get(),
+            # Always honour the selected '.SAFE unzip folder'. Previously this was
+            # forced blank in existing-.SAFE mode, which silently ignored the
+            # user's choice and extracted any zips in the source folder onto the
+            # (often slow/external) source drive. Blank still falls back to the
+            # source folder in run_pipeline, so pure existing-.SAFE mode is unchanged.
+            "safe_out_dir": self.v_safe_out_dir.get(),
             "safe_scratch_gb": self.v_safe_scratch_gb.get(),
             "snap_dir":    existing_snap_path if using_existing_snap else self.v_snap_dir.get(),
             "out_dir":     self.v_out_dir.get(),
@@ -6695,6 +7004,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             # follow whatever is checked and skip scenes already processed.
             cfg["retry_dates"] = set(retry_dates)
             cfg["do_download"] = True
+        if fill_missing:
+            # 'Download missing dates': search the chosen source over the whole
+            # [start,end] range but skip every scene whose date+orbit already has
+            # a final product — so only failed/never-downloaded dates are fetched
+            # and processed. Force download on; SNAP/indices follow the checkboxes.
+            cfg["do_download"] = True
+            cfg["skip_if_final"] = True
 
         if not cfg["aoi_path"] or not os.path.isfile(cfg["aoi_path"]):
             messagebox.showerror("AOI file missing",
@@ -6842,32 +7158,30 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._thread.start()
 
     def _on_retry_failed(self):
-        """Re-run only the dates whose download failed in the last run."""
+        """Download + process only the dates in the current [start,end] range that
+        are MISSING a final product — failed earlier OR never downloaded. Searches
+        the selected source, then skips every date that already has a final (so it
+        won't re-fetch anything already finished)."""
         if self._running:
             return
-        base = (self.v_out_dir.get().strip() or self.v_snap_dir.get().strip()
-                or self.v_safe_dir.get().strip())
-        if not base:
-            messagebox.showerror("Output missing", "Set an output folder first.")
+        src = self.v_safe_source.get()
+        if src in ("existing", "existing_zip", "existing_snap"):
+            messagebox.showerror("Pick a download source",
+                "Set the source selector to ASF, CDSE, CDSE S3, or Auto first —\n"
+                "'download missing dates' has to search a download source.")
             return
-        edir = os.path.join(base, "pipeline_errors")
-        # Download-phase logs are named "<sceneName>__download*.error.txt"; the
-        # acquisition date is embedded in the scene name as _YYYYMMDDTHHMMSS_.
-        dates = set()
-        for p in glob.glob(os.path.join(edir, "*__download*.error.txt")):
-            m = re.search(r"_(\d{8})T\d{6}", os.path.basename(p))
-            if m:
-                d = m.group(1)
-                dates.add(f"{d[:4]}-{d[4:6]}-{d[6:]}")
-        if not dates:
-            messagebox.showinfo("Retry failed downloads",
-                "No failed downloads logged — nothing to retry.")
+        s, e = self.v_start.get().strip(), self.v_end.get().strip()
+        src_lbl = {"asf": "ASF", "cdse": "CDSE", "cdse_s3": "CDSE S3",
+                   "auto": "Auto"}.get(src, "ASF")
+        if not messagebox.askyesno("Download missing / failed dates",
+                f"Search {src_lbl} over {s} → {e} and download + process only the "
+                f"dates you don't already have?\n\n"
+                f"A date is skipped if it exists at ANY stage in your folders — "
+                f"zip, .SAFE, SNAP GeoTIFF, or final product. Only dates truly "
+                f"absent everywhere are re-downloaded.\n\n"
+                f"Check SNAP + indices are on if you want them turned into finals."):
             return
-        dates = sorted(dates)
-        if not messagebox.askyesno("Retry failed downloads",
-                f"Re-download {len(dates)} failed date(s)?\n\n" + "\n".join(dates)):
-            return
-        self._on_start(retry_dates=dates)
+        self._on_start(fill_missing=True)
 
     def _on_window_close(self):
         if getattr(self, "_running", False):
