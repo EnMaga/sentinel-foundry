@@ -2605,6 +2605,14 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             try: self._on_stop()
             except Exception: pass
         self.destroy()
+        # Hard-exit so the process REALLY dies. Downloads run in a (non-daemon)
+        # ThreadPoolExecutor; a blocking requests.get / disk write keeps the
+        # interpreter alive after the window is gone → an orphan python lingers
+        # holding a handle on the SSD, so the user can't eject it. Same fix as
+        # SAR Foundry's _on_window_close.
+        # ponytail: os._exit skips atexit/flush — fine on quit (run-log per-line,
+        # config saved on change).
+        os._exit(0)
 
     def _on_stop(self):
         self._log("\n[Stopping — cancelling pending days (active HTTP requests will complete then exit)…]")

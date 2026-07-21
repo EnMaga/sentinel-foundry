@@ -436,15 +436,20 @@ def _clear_error(cfg, stem, phase):
         pass
 
 
-def _final_exists(out_dir, name):
+def _final_exists(out_dir, name, aoi_label=""):
     """True if a final product for this scene's acquisition date+orbit already
     exists under out_dir (any cluster/band). Finals are named
-    S1_<YYYYMMDD>_…_<ASC|DSC>_<band>.tif in out_dir's ASC/DSC subfolders.
+    S1_<YYYYMMDD>_SNAP_<aoi_label>_…_<ASC|DSC>_<band>.tif in out_dir's ASC/DSC
+    subfolders.
 
     Orbit is derived from the acquisition hour exactly as finals are named
     (_parse_safe_name: hour ≥ 12 → ASC), NOT from flightDirection, so the label
     always matches. Used by 'download missing dates' to skip scenes whose date is
-    already finished. Enabled only when cfg['skip_if_final'] is set."""
+    already finished. Enabled only when cfg['skip_if_final'] is set.
+
+    aoi_label scopes the glob to one AOI: the Batch tab merges many AOIs' finals
+    under a single <pipeline> folder, so an unscoped date+orbit match would let
+    one AOI skip a date another AOI finished. Blank → legacy broad match."""
     if not out_dir:
         return False
     m = re.search(r'_(\d{8})T(\d{2})', name)
@@ -452,19 +457,25 @@ def _final_exists(out_dir, name):
         return False
     date, hr = m.group(1), int(m.group(2))
     orbit = "ASC" if hr >= 12 else "DSC"
-    return bool(glob.glob(os.path.join(out_dir, "**", f"S1_{date}_*_{orbit}_*.tif"),
+    _lbl = f"SNAP_{aoi_label}_" if aoi_label else ""
+    return bool(glob.glob(os.path.join(out_dir, "**", f"S1_{date}_{_lbl}*_{orbit}_*.tif"),
                           recursive=True))
 
 
 def _already_have(cfg, name):
     """True if this scene's date+orbit already exists at ANY processed stage —
-    a SNAP GeoTIFF (snap_dir) or a final product (out_dir). Both are named
-    S1_<date>_..._<ASC|DSC>_*.tif, so one check covers each. (.SAFE/zip presence
-    is checked separately at each download site.) Used by 'download missing dates'
-    so a date already downloaded OR processed anywhere is skipped — only dates
-    truly absent from all folders get re-downloaded from the catalogue."""
-    return (_final_exists(cfg.get("out_dir", ""), name)
-            or _final_exists(cfg.get("snap_dir", ""), name))
+    a SNAP GeoTIFF (snap_dir), a final product (out_dir), or a group-done
+    sentinel (.done in snap_dir). The first two are named
+    S1_<date>_..._<ASC|DSC>_*.tif, so one check covers each. The sentinel matters
+    for zero-coverage dates: SNAP succeeds but the scene footprint covers no AOI
+    cluster, so it produces no .tif yet still writes a .done marker — without this
+    check 'download missing dates' re-downloads (then discards) those dates every
+    run forever. (.SAFE/zip presence is checked separately at each download site.)
+    Only dates truly absent from all folders get re-downloaded."""
+    _al = cfg.get("aoi_label", "")
+    return (_final_exists(cfg.get("out_dir", ""), name, _al)
+            or _final_exists(cfg.get("snap_dir", ""), name, _al)
+            or _group_done_marker(cfg, name))
 
 
 def _pending_index_error(cfg, date, orbit):
@@ -477,6 +488,42 @@ def _pending_index_error(cfg, date, orbit):
         return False
 
 
+def _done_dir(cfg):
+    """Per-AOI folder holding the SNAP group-done sentinels (.done).
+
+    Lives in the AOI's out_dir (the mother folder that also holds ASC/DSC), so
+    markers from different AOIs never share a folder — a plain
+    S1_<date>_..._<orbit>.done glob is then AOI-scoped (no cross-AOI collision).
+    Falls back to snap_dir when out_dir is unset. Path only — the caller creates
+    it (os.makedirs) at the write site so read-side checks have no side effects."""
+    base = (cfg.get("out_dir") or "").strip() or cfg.get("snap_dir", "")
+    return os.path.join(base, "Done_files_S1") if base else ""
+
+
+def _group_done_marker(cfg, name):
+    """True if a group-done sentinel (.done) exists for this scene's date+orbit.
+    SNAP writes it once a cluster group finishes (see _grp_sentinel) — including
+    zero-coverage dates that produce no .tif. Mirrors the authoritative SNAP skip
+    so 'download missing dates' agrees with the pipeline. A pending indices error
+    forces reprocess (returns False), matching _grp_done_cheap. The glob is
+    scoped to this AOI's label, so a Done_files_S1 folder shared by several
+    batch AOIs (pipeline-first layout) can't match another AOI's marker."""
+    ddir = _done_dir(cfg)
+    if not ddir:
+        return False
+    m = re.search(r'_(\d{8})T(\d{2})', name)
+    if not m:
+        return False
+    date, hr = m.group(1), int(m.group(2))
+    orbit = "ASC" if hr >= 12 else "DSC"
+    if _pending_index_error(cfg, date, orbit):
+        return False
+    _al = cfg.get("aoi_label", "")
+    _pat = (f"S1_{date}_SNAP_{_al}_*_{orbit}.done" if _al
+            else f"S1_{date}_SNAP_*_{orbit}.done")
+    return bool(glob.glob(os.path.join(ddir, _pat)))
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE LOGIC  (runs in background thread)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -487,7 +534,13 @@ def _reproject_outputs(out_dir: str, target_crs: str, log) -> None:
     import rasterio
     from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-    tifs = glob.glob(os.path.join(out_dir, "**", "*.tif"), recursive=True)
+    # Only THIS pipeline's own orbit subfolders (ASC/DSC) — never sibling data
+    # (e.g. S2 products) that happens to share the same output root. Globbing the
+    # whole tree reprojected everything under out_dir, mangling unrelated files.
+    tifs = [t for t in (
+                glob.glob(os.path.join(out_dir, "ASC", "**", "*.tif"), recursive=True) +
+                glob.glob(os.path.join(out_dir, "DSC", "**", "*.tif"), recursive=True))
+            if not t.endswith(".reproj.tif")]
     if not tifs:
         return
     log(f"  Reprojecting {len(tifs)} files to {target_crs} ...")
@@ -551,9 +604,12 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         # still read from — and deleted in — safe_dir; blank → .SAFE stay in safe_dir.
         safe_out   = (cfg.get("safe_out_dir") or "").strip() or safe_dir
         if safe_out != safe_dir and cfg.get("dl_source") == "cdse_s3":
-            log("  ⚠ CDSE S3 delivers .SAFE directly — '.SAFE unzip folder' ignored "
-                "(using the download folder).")
-            safe_out = safe_dir
+            # S3 delivers the .SAFE directly (no zip to extract), so honour the
+            # chosen '.SAFE unzip folder' by downloading STRAIGHT into it — for S3
+            # the download IS the extracted product, so safe_dir and safe_out
+            # coincide and there's no cross-drive copy.
+            log(f"  CDSE S3: no zip step — downloading .SAFE directly into {safe_out}")
+            safe_dir = safe_out
         # Existing-.SAFE mode: the .SAFE already sit in safe_dir (the folder the
         # user pointed at) and nothing is extracted, so SNAP must read safe_dir.
         # The '.SAFE unzip folder' (safe_out) only holds .SAFE when we actually
@@ -741,6 +797,12 @@ def run_pipeline(cfg, log, done_cb, progress_cb=None):
         else:
             log("Pipeline complete — no errors.")
         log("="*60)
+        # Flag a clean finish so the UI can offer the coverage-check / .done-cleanup
+        # reminder: no error logs, no failed downloads, and not user-stopped.
+        cfg["_run_clean"] = bool(
+            not _errs and not failed_downloads
+            and not (cfg.get("stop_event") and cfg["stop_event"].is_set()))
+        cfg["_done_dir"] = _done_dir(cfg)
         done_cb(True)
 
     except Exception as e:
@@ -778,17 +840,36 @@ def _mount_retries(session, total=4, backoff=2.0):
     return session
 
 
+def _fmt_rate(num_bytes, seconds):
+    """Download rate as MB/s (decimal MB — clearer for users than Mbps). Blank
+    when not measurable. Single place that owns the download-speed unit."""
+    if seconds <= 0 or num_bytes <= 0:
+        return ""
+    return f"{num_bytes / seconds / 1e6:.1f} MB/s"
+
+
 def _download_scene_with_retries(scene, safe_dir, session, asf, log, name,
                                  attempts=3):
     """Download one ASF scene, retrying with exponential backoff.
     asf_search has no resume, so any partial .zip is removed between attempts
     to avoid leaving a truncated archive behind."""
     zip_path = os.path.join(safe_dir, name + ".zip")
+    # Expected size from the catalogue — lets us catch a stalled/truncated transfer
+    # that asf_search returns WITHOUT raising (e.g. the 701s/3MB/0Mbps case). 0 = unknown.
+    try:
+        exp_bytes = int(scene.properties.get("bytes") or 0)
+    except Exception:
+        exp_bytes = 0
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
             scene.download(path=safe_dir, session=session,
                            fileType=asf.FileDownloadType.DEFAULT_FILE)
+            got = os.path.getsize(zip_path) if os.path.isfile(zip_path) else 0
+            if exp_bytes and got < exp_bytes * 0.9:
+                # returned "success" but the .zip is short → truncated; retry.
+                raise IOError(f"truncated download: {got//1048576} of "
+                              f"{exp_bytes//1048576} MB")
             return True, None
         except Exception as e:
             last_err = e
@@ -978,10 +1059,10 @@ def _download(cfg, safe_dir, log, progress_cb=None):
                 _prev[0] = sz; _prev[1] = t
                 done = dl_done
             if delta_t > 0 and delta_b > 1024:
-                speed = delta_b * 8 / delta_t / 1_048_576
+                _r = _fmt_rate(delta_b, delta_t)
                 progress_cb("download", done, n_dl,
-                            f"↓ {speed:.0f} Mbps  ({done}/{n_dl} done)",
-                            speed=f"{speed:.0f} Mbps")
+                            f"↓ {_r}  ({done}/{n_dl} done)",
+                            speed=_r)
 
     _mon_thread = threading.Thread(target=_speed_monitor, daemon=True)
     _mon_thread.start()
@@ -1019,8 +1100,9 @@ def _download(cfg, safe_dir, log, progress_cb=None):
             if ok:
                 elapsed  = time.time() - t0
                 sz_after = _scan_bytes(safe_dir)
-                delta_mb = max(0, sz_after - sz_before) / 1_048_576
-                spd_str  = f"{delta_mb * 8 / elapsed:.0f} Mbps" if elapsed > 0 else ""
+                _delta_b = max(0, sz_after - sz_before)
+                delta_mb = _delta_b / 1_048_576
+                spd_str  = _fmt_rate(_delta_b, elapsed)
                 dl_done += 1
                 progress_cb("download", dl_done, n_dl, f"{date} {dirn} ✓ {delta_mb:.0f}MB {spd_str}",
                             speed=spd_str)
@@ -1367,24 +1449,31 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
                                 _now = time.time()
                                 if _now - _last_emit >= 1.0:
                                     _el   = _now - t0
-                                    _mbps = (written - resume_from) * 8 / _el / 1e6 if _el > 0 else 0
-                                    _mb   = written / 1_048_576
+                                    _r  = _fmt_rate(written - resume_from, _el)
+                                    _mb = written / 1_048_576
                                     if total_sz:
-                                        _lbl = f"↓ {date} {written/total_sz*100:.0f}% {_mb:.0f}MB {_mbps:.0f}Mbps"
+                                        _lbl = f"↓ {date} {written/total_sz*100:.0f}% {_mb:.0f}MB {_r}"
                                     else:
-                                        _lbl = f"↓ {date} {_mb:.0f}MB {_mbps:.0f}Mbps"
+                                        _lbl = f"↓ {date} {_mb:.0f}MB {_r}"
                                     progress_cb("download", dl_done, n_dl, _lbl,
-                                                speed=f"{_mbps:.0f} Mbps")
+                                                speed=_r)
                                     _last_emit = _now
 
                 if _force_ev and _force_ev.is_set():
                     # force-killed mid-scene — keep the .part so a later run resumes
                     return None
 
+                # Verify the stream wasn't cut short: a server can close a
+                # connection cleanly (no exception) mid-file, which would rename a
+                # truncated .zip as complete. ASF and S3 check size; OData didn't —
+                # raising here keeps the .part so the next attempt resumes via Range.
+                if total_sz and written < total_sz * 0.9:
+                    raise IOError(f"truncated download: {written//1048576} of "
+                                  f"{total_sz//1048576} MB")
                 os.rename(zip_tmp, zip_path)
                 elapsed = time.time() - t0
                 mb      = written / 1_048_576
-                spd_str = f"{mb * 8 / elapsed:.0f} Mbps" if elapsed > 0 else ""
+                spd_str = _fmt_rate(written, elapsed)
                 with _lock:
                     dl_done += 1; _c = dl_done
                 progress_cb("download", _c, n_dl, f"{date} {dirn} ✓ {mb:.0f}MB {spd_str}",
@@ -1423,6 +1512,13 @@ def _download_cdse(cfg, safe_dir, log, progress_cb=None):
 
     _unzip_zips(safe_dir, log, progress_cb, _stop_ev, cfg)
     return failed
+
+
+class _S3Abort(Exception):
+    """Raised from the boto3 download Callback when the user hits Force-Stop, so
+    the in-flight s3.download_file aborts and releases its .partdir file handle
+    (a blocking download otherwise holds it until the whole file finishes,
+    leaving a .partdir the user can't delete)."""
 
 
 def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
@@ -1544,18 +1640,32 @@ def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
                     with _blk: got[0] += o["Size"]
                     return
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
-                s3.download_file("eodata", o["Key"], dst)
+                # Force-Stop (2nd press) / close aborts the in-flight transfer so
+                # the .partdir handle is freed and the user can delete it. A single
+                # (graceful) Stop does NOT set _force_ev, so the current file
+                # finishes — matching the CDSE loop's behaviour.
+                def _abort_cb(_bytes):
+                    if _force_ev and _force_ev.is_set():
+                        raise _S3Abort()
+                try:
+                    s3.download_file("eodata", o["Key"], dst, Callback=_abort_cb)
+                except _S3Abort:
+                    return                    # aborted by Force-Stop — partial kept, handle freed
+                except Exception:
+                    if _force_ev and _force_ev.is_set():
+                        return                # boto3 may wrap the abort — treat as stop
+                    raise                     # a real download error
                 with _blk:
                     got[0] += o["Size"]
                     _now = time.time()
                     if _now - _last[0] >= 1.0:
                         _el = _now - t0
-                        _mbps = got[0] * 8 / _el / 1e6 if _el > 0 else 0
+                        _r  = _fmt_rate(got[0], _el)
                         with _lock: _c = _done[0]
                         progress_cb("download", _c, n_dl,
                                     f"↓ {date} {got[0]/total_sz*100:.0f}% "
-                                    f"{got[0]/1_048_576:.0f}MB {_mbps:.0f}Mbps",
-                                    speed=f"{_mbps:.0f} Mbps")
+                                    f"{got[0]/1_048_576:.0f}MB {_r}",
+                                    speed=_r)
                         _last[0] = _now
 
             with ThreadPoolExecutor(max_workers=N_OBJ) as fpool:
@@ -1586,7 +1696,7 @@ def _download_cdse_s3(cfg, safe_dir, log, progress_cb=None):
 
             elapsed = time.time() - t0
             mb  = total_sz / 1_048_576
-            spd = f"{mb*8/elapsed:.0f} Mbps" if elapsed > 0 else ""
+            spd = _fmt_rate(total_sz, elapsed)
             with _lock: _done[0] += 1; _c = _done[0]
             log(f"     ✓  {base[:28]}  {elapsed:.0f}s  {mb:.0f} MB  {spd}")
             _clear_error(cfg, name, "download_s3")
@@ -2240,6 +2350,8 @@ class _ReadyBudget:
         self.pending = 0      # footprint of downloaded-but-not-cleaned product
         self.finished = False
         self.seen = set()
+        self.recorded_total = 0.0   # cumulative footprint ever handed over (for chunk estimate)
+        self.recorded_count = 0     # products ever handed over
 
     def _stopped(self):
         return self.stop is not None and self.stop.is_set()
@@ -2266,6 +2378,8 @@ class _ReadyBudget:
         fp = self._footprint(path)
         self.ready.append((path, fp))
         self.pending += fp
+        self.recorded_total += fp
+        self.recorded_count += 1
         return fp
 
     def seed(self, path):
@@ -2293,16 +2407,27 @@ class _ReadyBudget:
     def take_chunk(self, chunk_budget):
         """Block until ≥1 product is ready (or the producer is done/stopped), then
         return products totalling ≤ chunk_budget (always ≥1 so a lone oversized
-        scene still moves). Returns [] only when fully drained."""
+        scene still moves). Returns [] only when fully drained.
+
+        ALL frames of one (date, orbit) go in the SAME chunk, even if that pushes
+        the chunk over budget — never split a multi-frame date, or _snap_process
+        would mosaic it with only this chunk's frames and write a premature .done
+        sentinel, permanently dropping the rest (seam/coverage gap). A NEW group
+        that would exceed budget is deferred to the next chunk instead."""
         with self.cv:
             while not self.ready and not self.finished and not self._stopped():
                 self.cv.wait(timeout=1.0)
-            chunk, sz = [], 0.0
-            while self.ready:
-                p, fp = self.ready[0]
-                if chunk and sz + fp > chunk_budget:
-                    break
-                self.ready.pop(0); chunk.append((p, fp)); sz += fp
+            chunk, sz, taken, rest = [], 0.0, set(), []
+            for p, fp in self.ready:
+                _d, _s, _orb = _parse_safe_name(p)
+                key = (_d, _orb) if _d else p          # unparseable → its own group
+                if key in taken:
+                    chunk.append((p, fp)); sz += fp     # sibling frame — keep with its group
+                elif not chunk or sz + fp <= chunk_budget:
+                    chunk.append((p, fp)); sz += fp; taken.add(key)
+                else:
+                    rest.append((p, fp))                # new group over budget → next chunk
+            self.ready = rest
             return chunk
 
     def free(self, footprint):
@@ -2324,6 +2449,28 @@ def _process_one_chunk(cfg, paths, safe_dir, safe_out, snap_dir, log, progress_c
     zips = [p for p in paths if str(p).lower().endswith(".zip") and os.path.isfile(p)]
     if zips:
         _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=zips)
+    # Already-extracted .SAFE (S3/CDSE deliver these directly into the download
+    # folder, not as a zip) must sit under safe_out — that's the only folder
+    # _snap_process scans. Without this, a split config (zips on drive A, extract
+    # to drive B) strands every direct-.SAFE download → "Processing 0 .SAFE files".
+    # ponytail: cross-drive .SAFE moves to C: (copy+delete, bounded by chunk
+    # budget); if that copy hurts, teach _snap_process to scan the source folder
+    # instead of relocating.
+    for p in paths:
+        if not (str(p).lower().endswith(".safe") and os.path.isdir(p)):
+            continue
+        dst = os.path.join(safe_out, os.path.basename(p))
+        if os.path.abspath(p) == os.path.abspath(dst) or os.path.isdir(dst):
+            continue
+        try:
+            os.makedirs(safe_out, exist_ok=True)
+            try:
+                os.replace(p, dst)          # same volume: instant
+            except OSError:
+                shutil.move(p, dst)         # cross-volume: copy + delete
+        except Exception as _mv:
+            log(f"  [chunk] could not stage {os.path.basename(p)} into "
+                f"safe_out — SNAP may miss it: {_mv}")
     if cfg.get("do_snap"):
         _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
         # Finals per batch (see the static loop's note): _compute_indices scans
@@ -2353,12 +2500,35 @@ def _run_pipelined(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_c
         gate.seed(z)
     for s in sorted(glob.glob(os.path.join(safe_out, "*.SAFE"))):
         gate.seed(s)
+    # Direct-.SAFE backends (S3/CDSE) land the .SAFE in safe_dir, not safe_out —
+    # seed those too, else a resumed run whose downloader skips re-fetching them
+    # never hands them over. (safe_dir == safe_out → dedupe against the loop above.)
+    if os.path.abspath(safe_dir) != os.path.abspath(safe_out):
+        for s in sorted(glob.glob(os.path.join(safe_dir, "*.SAFE"))):
+            gate.seed(s)
+
+    # Capture the download total (scenes to fetch) as it's reported, so the
+    # "Batch" bar can show chunk k/~N — N projected from the catalogue: the
+    # per-scene footprint seen so far × the full scene count, ÷ the chunk budget.
+    _dl_total = [0]
+    def _pcb(phase, cur, tot, label="", speed=""):
+        if phase == "download" and tot:
+            _dl_total[0] = tot
+        progress_cb(phase, cur, tot, label, speed)
+
+    def _est_chunks():
+        rc = gate.recorded_count
+        if rc <= 0:
+            return 0
+        import math as _math
+        proj = gate.recorded_total / rc * max(_dl_total[0], rc)
+        return max(_n, int(_math.ceil(proj / chunk_budget)))
 
     result = {}
     def _producer():
         try:
             cfg["_on_ready"] = gate.add
-            result["failed"] = _download_dispatch(cfg, safe_dir, log, progress_cb) or []
+            result["failed"] = _download_dispatch(cfg, safe_dir, log, _pcb) or []
         except Exception as e:
             import traceback as _tb
             result["error"] = e
@@ -2386,11 +2556,13 @@ def _run_pipelined(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progress_c
         _n += 1
         _gb = sum(fp for _, fp in chunk) / (1024 ** 3)
         log(f"\n── Batch {_n}: {len(chunk)} scene(s), ~{_gb:.1f} GB .SAFE (pipelined) ──")
+        progress_cb("unzip", _n - 1, _est_chunks(), "batch")   # chunk starting
         try:
             _process_one_chunk(cfg, [p for p, _ in chunk], safe_dir, safe_out,
-                               snap_dir, log, progress_cb, stop_ev)
+                               snap_dir, log, _pcb, stop_ev)
         finally:
             gate.free(sum(fp for _, fp in chunk))   # MUST free or producer deadlocks
+        progress_cb("unzip", _n, _est_chunks(), "batch")       # chunk done
         log(f"  ⏱ Batch {_n} done — {_fmt_dur(time.time() - _t0)} elapsed")
         if stop_ev and stop_ev.is_set():
             log(f"  [Stopped — finished batch {_n}; halting before next]")
@@ -2410,6 +2582,9 @@ def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progr
 
     overlap=True runs the pipelined variant instead: download and process overlap,
     so batch N+1's zips are pre-fetched while batch N runs (see _run_pipelined)."""
+    # Chunked mode: the "unzip" bar now tracks whole chunks (see _unzip_zips),
+    # so per-file ticks are suppressed and the batch loop drives that bar instead.
+    cfg["_chunked"] = True
     if overlap:
         return _run_pipelined(cfg, safe_dir, safe_out, snap_dir, budget_gb,
                               log, progress_cb, stop_ev)
@@ -2421,21 +2596,30 @@ def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progr
             _snap_process(cfg, safe_out, snap_dir, log, progress_cb)
         return
     budget = budget_gb * (1024**3)
-    chunks, cur, cursz = [], [], 0.0
+    chunks, cur, cursz, curkey = [], [], 0.0, None
     for zp in zips:
         try:
             s = os.path.getsize(zp) * _EST
         except OSError:
             s = 0
-        if cur and cursz + s > budget:
+        _d, _sa, _orb = _parse_safe_name(zp)
+        key = (_d, _orb) if _d else zp
+        # Break a chunk only at a NEW (date,orbit) group — never split a
+        # multi-frame date across chunks, or the first chunk mosaics with only
+        # its frames and writes a premature .done, dropping the rest. Mirrors
+        # take_chunk's rule for the pipelined path (zips are sorted, so all
+        # frames of one group are adjacent).
+        if cur and key != curkey and cursz + s > budget:
             chunks.append(cur); cur, cursz = [], 0.0
-        cur.append(zp); cursz += s
+        cur.append(zp); cursz += s; curkey = key
     if cur:
         chunks.append(cur)
     log(f"  Batch mode: {len(zips)} scene(s) → {len(chunks)} chunk(s) of "
         f"≤ {budget_gb:g} GB .SAFE, output {safe_out}")
     _total = len(chunks)
     _t0 = time.time()
+    # Static path: chunk count is known exactly, so drive the "Batch" bar with it.
+    progress_cb("unzip", 0, _total, "batch")
     # Stop is checked only at batch boundaries (top + end of each iteration): a
     # batch that has started runs to completion (SNAP + finals), it just won't
     # start the next one — so Stop never leaves a half-processed batch.
@@ -2447,6 +2631,7 @@ def _process_in_batches(cfg, safe_dir, safe_out, snap_dir, budget_gb, log, progr
         # Drive-online check, extract, SNAP, indices, and per-chunk .SAFE cleanup
         # all happen in _process_one_chunk (shared with the pipelined runner).
         _process_one_chunk(cfg, chunk, safe_dir, safe_out, snap_dir, log, progress_cb, stop_ev)
+        progress_cb("unzip", i, _total, "batch")   # chunk i of _total done
         _el = time.time() - _t0
         if i < _total:
             _eta = _el / i * (_total - i)
@@ -2538,7 +2723,10 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
             with _ulock:
                 _udone[0] += 1
                 _d = _udone[0]
-            progress_cb("unzip", _d, n_zip, msg)
+            # In chunked/batch mode the "unzip" bar shows whole-chunk progress
+            # (driven by the batch loop), so suppress the per-file ticks here.
+            if not cfg.get("_chunked"):
+                progress_cb("unzip", _d, n_zip, msg)
 
         if os.path.isdir(safe_path):
             if not cfg.get("keep_zips"):
@@ -2647,8 +2835,9 @@ def _unzip_zips(safe_dir, log, progress_cb, stop_ev, cfg, only_zips=None):
         _tick(f"{stem[:28]}  ✓")
 
     # Seed the progress history at current=0 so the ETA has a time base as soon
-    # as the first archive finishes.
-    progress_cb("unzip", 0, n_zip, "starting…")
+    # as the first archive finishes. Suppressed in chunked mode (batch bar owns it).
+    if not cfg.get("_chunked"):
+        progress_cb("unzip", 0, n_zip, "starting…")
     with ThreadPoolExecutor(max_workers=_uw) as pool:
         futs = {pool.submit(_unzip_one, zp): zp for zp in zips}
         for f in as_completed(futs):
@@ -3243,6 +3432,50 @@ def _cluster_polygons(gdf_wgs84, max_gap_km=5.0, edge_buffer_m=200.0):
     return clusters, coverage
 
 
+def _prepare_clusters(aoi_path, fields_path, gap):
+    """Pure (no Tk) AOI read + field-clustering. Returns a dict:
+        union_wkt, clusters (list of sub_aois), coverage, npoly, logs[], error?
+    Shared by the single-AOI tab (via _prep) and the Batch tab (per AOI, off the
+    UI thread). Clusters from the fields file when given, else from the AOI's own
+    polygons. Safe to call on a worker thread — no widget/messagebox calls."""
+    out = {"logs": [], "clusters": [], "coverage": 1.0, "npoly": 1}
+    try:
+        import geopandas as gpd
+        gdf = gpd.read_file(aoi_path).to_crs("EPSG:4326")
+        union = _safe_union(gdf)
+        out["union_wkt"] = union.wkt
+    except Exception as e:
+        out["error"] = ("AOI", f"Cannot read AOI file:\n{e}")
+        return out
+    try:
+        if fields_path:
+            _csrc = _read_fields(fields_path).to_crs("EPSG:4326")
+            try: _csrc["geometry"] = _csrc.geometry.make_valid()
+            except Exception: _csrc["geometry"] = _csrc.geometry.buffer(0)
+            _total = len(_csrc)
+            _sel = _csrc[_csrc.intersects(union)]
+            if len(_sel) == 0:
+                out["logs"].append("[fields] no field polygons fall inside "
+                                   "the AOI — using whole AOI")
+            else:
+                _csrc = _sel
+                out["logs"].append(f"[fields] {len(_csrc)} of {_total} field "
+                                   "polygons fall inside the AOI")
+        else:
+            _csrc = gdf
+        out["npoly"] = int(len(_csrc))
+    except Exception as _ce:
+        _csrc, out["npoly"] = gdf, 1
+        out["logs"].append(f"[fields] could not read fields file: {_ce}")
+    if out["npoly"] > 1:
+        try:
+            out["clusters"], out["coverage"] = _cluster_polygons(
+                _csrc, max_gap_km=gap)
+        except Exception as _ce:
+            out["logs"].append(f"[fields] clustering skipped: {_ce}")
+    return out
+
+
 def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
     if progress_cb is None:
         progress_cb = lambda *a, **kw: None
@@ -3357,7 +3590,7 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
         # Written once SNAP+cut finishes for a cluster group. Authoritative
         # "STEP 2 done" marker: clusters outside the scene footprint never get
         # a .tif, so an all-clusters-present check re-runs the group forever.
-        return os.path.join(snap_dir,
+        return os.path.join(_done_dir(cfg) or snap_dir,
             f"S1_{date}_SNAP_{aoi_label}_{speckle_tag}_{dem_tag}"
             f"_{graph_tag}_{sat0}_{orbit}.done")
 
@@ -3439,6 +3672,22 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
                     return True
             return False
 
+        def _write_group_done():
+            """Write this (date, orbit) group's per-AOI .done sentinel (idempotent).
+            The cluster path writes its own at the end; this covers the NON-cluster
+            (single sub-AOI) path — used by the Batch tab, which never builds
+            sub_aois — where .done was previously never written at all. Called both
+            when a group is freshly finished AND when it's skipped because its final
+            already exists, so re-runs backfill markers for already-done dates."""
+            try:
+                _sent = _grp_sentinel(date, orbit, sat0)
+                os.makedirs(os.path.dirname(_sent), exist_ok=True)
+                if not os.path.isfile(_sent):
+                    with open(_sent, "w", encoding="utf-8") as _sf:
+                        _sf.write(f"frames={n_tiles}\n")
+            except Exception:
+                pass
+
         # ── skip logic + choose the single SNAP subset region ──────────────
         if multi:
             _sentinel = _grp_sentinel(date, orbit, sat0)
@@ -3457,6 +3706,7 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
             final_path = os.path.join(snap_dir, base + ".tif")
             if _valid_raster(final_path):
                 log(f"  [{_g}/{total_groups}] SKIP {date} [{orbit}]  (SNAP GeoTIFF exists)")
+                _write_group_done()
                 _mark_skip(f"{date} [{orbit}]  skip")
                 return
             _cog_pattern = os.path.join(cfg.get("out_dir", ""), orbit,
@@ -3464,6 +3714,7 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
             if (cfg.get("out_dir") and not _pending_index_error(cfg, date, orbit)
                     and glob.glob(_cog_pattern)):
                 log(f"  [{_g}/{total_groups}] SKIP {date} [{orbit}]  (COG indices already exist)")
+                _write_group_done()
                 _mark_skip(f"{date} [{orbit}]  skip")
                 return
             proc_path = final_path
@@ -3536,8 +3787,15 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
                 # outside this scene's footprint never produce a .tif, so an
                 # all-clusters-present check would re-run this date forever.
                 try:
-                    with open(_grp_sentinel(date, orbit, sat0), "w",
+                    _sent = _grp_sentinel(date, orbit, sat0)
+                    os.makedirs(os.path.dirname(_sent), exist_ok=True)
+                    with open(_sent, "w",
                               encoding="utf-8") as _sf:
+                        # First line records how many source frames produced this
+                        # mosaic → lets 'Check & repair' spot a date later completed
+                        # from fewer frames than the catalogue has. Legacy sentinels
+                        # lack it; _sentinel_frame_count() returns None for those.
+                        _sf.write(f"frames={n_tiles}\n")
                         _sf.write("\n".join(os.path.basename(w) for w in written))
                 except Exception:
                     pass
@@ -3555,6 +3813,7 @@ def _snap_process(cfg, safe_dir, snap_dir, log, progress_cb=None):
                         log(f"    masked to {_nf} field polygons (nodata outside)")
                 except Exception as _mk:
                     log(f"    [mask] skipped: {_mk}")
+            _write_group_done()
             _mark_done(f"{date} [{orbit}]  ✓")
 
     def _do_group(key_slist):
@@ -4116,10 +4375,18 @@ def _clean_safe(safe_dir, log, snap_dir=None, cfg=None):
         date, _sat, orbit = _parse_safe_name(s)
         if not date:
             return False   # unparseable name — keep it, never risk deleting good data
-        pats = [os.path.join(snap_dir, f"S1_{date}_*_{orbit}*.tif"),
-                os.path.join(snap_dir, f"S1_{date}_*_{orbit}*.done")]
+        # Scope to this AOI's label — out_dir/Done_files_S1 are shared by several
+        # AOIs in the pipeline-first batch layout, so an unscoped match could see
+        # ANOTHER AOI's final and wrongly delete this AOI's not-yet-converted
+        # .SAFE. Blank label → legacy broad match (single-AOI, per-AOI folders).
+        _al = cfg.get("aoi_label", "") if cfg else ""
+        _lbl = f"SNAP_{_al}_" if _al else ""
+        pats = [os.path.join(snap_dir, f"S1_{date}_{_lbl}*_{orbit}*.tif")]
+        _dd = _done_dir(cfg) if cfg else ""
+        if _dd:
+            pats.append(os.path.join(_dd, f"S1_{date}_{_lbl}*_{orbit}*.done"))
         if cfg and cfg.get("out_dir"):
-            pats.append(os.path.join(cfg["out_dir"], orbit, f"S1_{date}_*_{orbit}_*.tif"))
+            pats.append(os.path.join(cfg["out_dir"], orbit, f"S1_{date}_{_lbl}*_{orbit}_*.tif"))
         return any(glob.glob(p) for p in pats)
 
     removed = kept = 0
@@ -5525,7 +5792,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                     f"{_dates:<26}"
                     f"{str(h.get('orbit','?')):<7}"
                     f"{h.get('speckle','?')}")
-        self._btn(footer, "↻  Download missing / failed dates", self._on_retry_failed,
+        self._btn(footer, "↻  Continue downloading / Check missing dates", self._on_retry_failed,
                   color=GOLD, font=(_FONT_FAM, 9, "bold"), pady=4
                   ).pack(fill=tk.X, padx=8, pady=(0, 2))
         self._btn(footer, "📋  Run history", _show_history,
@@ -5595,11 +5862,16 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         prog_frame = tk.Frame(parent, bg=SURFACE)
         prog_frame.pack(fill=tk.X, padx=6, pady=(4,0))
         self._prog_bars = {}
-        for _phase, _lbl in [("download","Download"),("unzip","Unzip"),("process","Processing")]:
+        self._prog_llabels = {}    # phase → left-hand label widget (retitled in batch mode)
+        self._prog_rows = {}       # phase → row Frame (AOI row is shown/hidden dynamically)
+        # "aoi" first so it sits on top; it's hidden until a multi-AOI batch sends
+        # an "aoi" event, so single-AOI and single-AOI-batch runs look unchanged.
+        for _phase, _lbl in [("aoi","AOI"),("download","Download"),("unzip","Unzip"),("process","Processing")]:
             _r = tk.Frame(prog_frame, bg=SURFACE); _r.pack(fill=tk.X, pady=1)
-            tk.Label(_r, text=f"{_lbl}:", font=(_FONT_FAM,8,"bold"),
-                     bg=SURFACE, fg=FG2, width=11, anchor="w").pack(side=tk.LEFT)
-            # live "ETA ~4m · 145 Mbps" pinned to the right of THIS phase's bar
+            _ll = tk.Label(_r, text=f"{_lbl}:", font=(_FONT_FAM,8,"bold"),
+                     bg=SURFACE, fg=FG2, width=11, anchor="w")
+            _ll.pack(side=tk.LEFT)
+            # live "ETA ~4m · 23.1 MB/s" pinned to the right of THIS phase's bar
             _stat = tk.StringVar(value="")
             tk.Label(_r, textvariable=_stat, font=FONT_MONO,
                      bg=SURFACE, fg=ACCENT_L, width=24, anchor="e").pack(side=tk.RIGHT)
@@ -5609,6 +5881,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             _bar = ttk.Progressbar(_r, mode="determinate", maximum=100, value=0)
             _bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4,4))
             self._prog_bars[_phase] = (_bar, _cnt, _stat)
+            self._prog_llabels[_phase] = _ll
+            self._prog_rows[_phase] = _r
+        self._prog_rows["aoi"].pack_forget()   # multi-AOI only — revealed on first "aoi" event
         # elapsed row (overall wall-clock; per-phase ETA/speed live on the bars)
         eta_row = tk.Frame(parent, bg=SURFACE)
         eta_row.pack(fill=tk.X, padx=8, pady=(4, 2))
@@ -5649,7 +5924,24 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 return
             if not hasattr(self, "_prog_bars") or phase not in self._prog_bars:
                 return
+            # AOI progress (multi-AOI batch only): reveal the top bar on first use
+            # and show the AOI name; it has no meaningful ETA/rate of its own.
+            if phase == "aoi":
+                row = self._prog_rows.get("aoi") if hasattr(self, "_prog_rows") else None
+                if row is not None and not row.winfo_ismapped():
+                    row.pack(fill=tk.X, pady=1, before=self._prog_rows["download"])
+                bar, cnt_var, stat_var = self._prog_bars["aoi"]
+                bar["value"] = (current / total * 100) if total > 0 else 0
+                cnt_var.set(f"{current}/{total}" if total > 0 else "")
+                stat_var.set(str(label)[:24])
+                return
             bar, cnt_var, stat_var = self._prog_bars[phase]
+            # In batch/chunked mode the "unzip" bar tracks whole chunks, not files,
+            # so retitle it "Batch"; the caller signals this with a "batch…" label.
+            if phase == "unzip" and hasattr(self, "_prog_llabels"):
+                _ll = self._prog_llabels.get("unzip")
+                if _ll is not None:
+                    _ll.config(text="Batch:" if str(label).startswith("batch") else "Unzip:")
             pct = (current / total * 100) if total > 0 else 0
             bar["value"] = pct
             cnt_var.set(f"{current}/{total}" if total > 0 else "")
@@ -5661,7 +5953,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 return f"{s//3600}h {(s%3600)//60:02d}m"
 
             # Speed/throughput shown right of the bar. Download passes a live
-            # byte rate ("145 Mbps"); other phases derive scenes/min from the
+            # byte rate ("23.1 MB/s"); other phases derive scenes/min from the
             # recent completion history below.
             if not hasattr(self, "_pipeline_start") or not self._pipeline_start:
                 if speed:
@@ -5717,6 +6009,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             bar["value"] = 0
             cnt_var.set("")
             txt_var.set("")
+        # hide the AOI bar again (revealed only by a multi-AOI "aoi" event) and
+        # restore the "unzip" title in case a batch run retitled it "Batch"
+        if hasattr(self, "_prog_rows") and self._prog_rows.get("aoi"):
+            self._prog_rows["aoi"].pack_forget()
+        if hasattr(self, "_prog_llabels") and self._prog_llabels.get("unzip"):
+            self._prog_llabels["unzip"].config(text="Unzip:")
         if hasattr(self, "_eta_var"):     self._eta_var.set("")
         if hasattr(self, "_elapsed_var"): self._elapsed_var.set("")
         self._pipeline_start = None
@@ -6042,6 +6340,59 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         dlg.update_idletasks()
         dlg.geometry(f"+{self.winfo_x() + 220}+{self.winfo_y() + 140}")
 
+    def _open_per_aoi_filter_config(self, aoi_path, name):
+        """Per-AOI speckle param editor: same schema as _open_filter_config but
+        writes into self._batch_per_aoi_params[aoi_path], so each AOI can tune the
+        SAME filter differently. Params are keyed to the filter selected on that
+        row; picking a different filter starts fresh from its defaults."""
+        if name in ("none", "None", "", None):
+            messagebox.showinfo("Speckle", "'none' has no parameters to configure.")
+            return
+        schema = FILTER_SCHEMAS.get(name, [])
+        if not schema:
+            messagebox.showinfo("Speckle", f"No tunable parameters for {name}.")
+            return
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Configure — {os.path.basename(aoi_path)[:20]} · {name}")
+        dlg.configure(bg=BG); dlg.resizable(False, False); dlg.grab_set()
+        saved = self._batch_per_aoi_params.get(aoi_path) or {}
+        if saved.get("filter") != name:   # stale params for a different filter → defaults
+            saved = dict(FILTER_DEFAULTS.get(name, {"filter": name}))
+        pvars = {}
+        for item in schema:
+            key, wtype, lbl = item[0], item[1], item[2]
+            row = tk.Frame(dlg, bg=BG); row.pack(fill=tk.X, padx=14, pady=3)
+            tk.Label(row, text=lbl, font=FONT, bg=BG, fg=FG, width=24, anchor="w").pack(side=tk.LEFT)
+            if wtype == "bool":
+                var = tk.BooleanVar(value=(saved.get(key, "true" if item[3] else "false") == "true"))
+                tk.Checkbutton(row, variable=var, bg=BG, selectcolor=BG2,
+                               activebackground=BG, fg=FG, activeforeground=ACCENT_L).pack(side=tk.LEFT)
+            elif wtype == "choice":
+                choices, dflt = item[3], item[4]
+                cur = saved.get(key, dflt)
+                var = tk.StringVar(value=cur if cur in choices else dflt)
+                self._mk_optmenu(row, var, choices).pack(side=tk.LEFT)
+            else:
+                mn, mx, dflt = item[3], item[4], item[5]
+                var = tk.StringVar(value=saved.get(key, str(dflt)))
+                self._entry(row, var, width=8).pack(side=tk.LEFT)
+                tk.Label(row, text=f"  ({mn}-{mx})", font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(side=tk.LEFT)
+            pvars[key] = var
+        def _apply():
+            params = dict(FILTER_DEFAULTS.get(name, {"filter": name}))
+            params["filter"] = name
+            for item in schema:
+                key, wtype = item[0], item[1]
+                v = pvars[key].get()
+                params[key] = ("true" if v else "false") if wtype == "bool" else str(v).strip()
+            self._batch_per_aoi_params[aoi_path] = params
+            dlg.destroy()
+        _bfr = tk.Frame(dlg, bg=BG); _bfr.pack(fill=tk.X, padx=14, pady=10)
+        self._btn(_bfr, "  Apply  ", _apply).pack(side=tk.RIGHT, padx=(6, 0))
+        self._btn(_bfr, "  Cancel  ", dlg.destroy, color=BG2).pack(side=tk.RIGHT)
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_x() + 220}+{self.winfo_y() + 140}")
+
     def _on_remember_change(self):
         """Save or clear credentials when checkbox changes. Stored in plain text
         in sar_foundry_config.json — the CDSE password is included at the user's
@@ -6310,6 +6661,11 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._batch_aois = [a for a in _bsaved.get("aois", []) if os.path.isfile(a)]
         self._batch_per_aoi = {}   # aoi_path -> (preset_var, speckle_var, start_var, end_var)
         self._batch_saved_per_aoi = _bsaved.get("per_aoi", {})  # seeds per-AOI rows on rebuild
+        # per-AOI tuned speckle params (the ⚙ button) — {aoi_path: params}; seeded
+        # from any that were persisted, so tuning survives a reopen.
+        self._batch_per_aoi_params = {p: d["speckle_params"]
+                                      for p, d in self._batch_saved_per_aoi.items()
+                                      if isinstance(d, dict) and d.get("speckle_params")}
         # speckle selection state for the popup (all-combinations mode)
         _sp_saved = _bsaved.get("speckle_params", {})
         _sp_on    = set(_bsaved.get("all_speckles_on", ["Lee Sigma"]))
@@ -6341,7 +6697,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._btn(btns, "＋ Add files…", self._batch_add_files, color=BG2).pack(side=tk.LEFT)
         self._btn(btns, "📁 Add folder…", self._batch_add_folder, color=BG2).pack(side=tk.LEFT, padx=4)
         self._btn(btns, "－ Remove", self._batch_remove, color=BG2).pack(side=tk.LEFT)
-        self._btn(btns, "Clear", self._batch_clear, color=BG2).pack(side=tk.LEFT, padx=4)
+        self._btn(btns, "🗑 Delete all", self._batch_clear, color=BG2).pack(side=tk.LEFT, padx=4)
 
         # 2. Pipeline assignment
         self._section(p, "2. Pipeline assignment")
@@ -6391,17 +6747,29 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             tk.Checkbutton(_cd_grid, text=t, variable=self.v_batch_cd[t], bg=BG, font=FONT, fg=FG,
                            selectcolor=BG2, activebackground=BG, activeforeground=ACCENT_L
                            ).grid(row=_i // 4, column=_i % 4, sticky="w", padx=4)
+        tk.Label(self.batch_all_fr,
+                 text="  Date range: uses the Download tab's Start/End for every combination.",
+                 font=(_FONT_FAM, 8, "italic"), bg=BG, fg=FG2).pack(anchor="w", padx=28, pady=(4, 0))
 
         self.batch_per_fr = tk.Frame(p, bg=BG)
         tk.Label(self.batch_per_fr, text="  (one row per AOI — add AOIs above first).  "
                  "Dates: YYYY-MM-DD, default = Download tab's range.",
                  font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(anchor="w", padx=28)
-        self._btn(self.batch_per_fr, "Apply row 1's dates to all", self._batch_apply_row1_dates,
-                  color=BG2).pack(anchor="w", padx=28, pady=(0, 2))
-        _ph = tk.Frame(self.batch_per_fr, bg=BG); _ph.pack(fill=tk.X, padx=28)
-        tk.Label(_ph, text="AOI", font=(_FONT_FAM, 8), bg=BG, fg=FG2, width=24, anchor="w").pack(side=tk.LEFT)
-        tk.Label(_ph, text="pipeline / speckle / DEM / start / end", font=(_FONT_FAM, 8), bg=BG, fg=FG2).pack(side=tk.LEFT)
-        self.batch_per_rows = tk.Frame(self.batch_per_fr, bg=BG); self.batch_per_rows.pack(fill=tk.X, padx=28)
+        # Per-AOI table as a GRID so the header "→all" buttons line up exactly over
+        # their column widgets below — matching `width=` does NOT align OptionMenu /
+        # Button / Entry (different padding + the dropdown arrow). Header is grid
+        # row 0; AOI rows are (re)built into rows ≥ 1 by _rebuild_batch_per_aoi,
+        # using the SAME grid columns so each column self-sizes to its widest cell.
+        self.batch_per_grid = tk.Frame(self.batch_per_fr, bg=BG)
+        self.batch_per_grid.pack(fill=tk.X, padx=28, pady=(2, 0))
+        tk.Label(self.batch_per_grid, text="set row 1 → all:", font=(_FONT_FAM, 8),
+                 bg=BG, fg=FG2, anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        # (grid-col, label, tuple-index into pipeline0/speckle1/start2/end3/dem4)
+        for _gc, _txt, _i in [(1, "pipeline→all", 0), (2, "speckle→all", 1),
+                              (4, "DEM→all", 4), (5, "start→all", 2), (6, "end→all", 3)]:
+            self._btn(self.batch_per_grid, _txt,
+                      lambda i=_i: self._batch_apply_col_to_all(i),
+                      color=BG2, font=(_FONT_FAM, 8)).grid(row=0, column=_gc, sticky="ew", padx=1, pady=(0, 2))
 
         # 3. Common settings (shared by every AOI) — bound to the same vars as
         # the Download/Processing tabs, so editing here edits the shared state.
@@ -6479,9 +6847,41 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             del self._batch_aois[i]
         self._refresh_batch_listbox()
 
-    def _batch_clear(self):
-        self._batch_aois = []
+    def _batch_remove_one(self, pth):
+        """Remove a single AOI from the batch queue (per-row 🗑), with a confirm.
+        Only edits the queue — nothing on disk is deleted."""
+        if getattr(self, "_running", False):
+            messagebox.showinfo("Batch running", "Stop the batch before editing the AOI list.")
+            return
+        if not messagebox.askyesno("Remove AOI",
+                f"Remove this AOI from the batch list?\n\n{os.path.basename(pth)}\n\n"
+                "Only removes it from the queue — downloaded/processed files on disk "
+                "are NOT deleted."):
+            return
+        if pth in self._batch_aois:
+            self._batch_aois.remove(pth)
+        self._batch_per_aoi.pop(pth, None)
+        self._batch_per_aoi_params.pop(pth, None)
         self._refresh_batch_listbox()
+        self._save_batch_state()
+
+    def _batch_clear(self):
+        """Delete ALL AOIs from the batch queue (with a confirm). Nothing on disk
+        is deleted — only the queue is cleared."""
+        if getattr(self, "_running", False):
+            messagebox.showinfo("Batch running", "Stop the batch before editing the AOI list.")
+            return
+        if not self._batch_aois:
+            return
+        if not messagebox.askyesno("Delete all AOIs",
+                f"Remove all {len(self._batch_aois)} AOI(s) from the batch list?\n\n"
+                "Only clears the queue — files on disk are NOT deleted."):
+            return
+        self._batch_aois = []
+        self._batch_per_aoi = {}
+        self._batch_per_aoi_params = {}
+        self._refresh_batch_listbox()
+        self._save_batch_state()
 
     def _refresh_batch_listbox(self):
         self.batch_listbox.delete(0, tk.END)
@@ -6503,12 +6903,18 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             self._rebuild_batch_per_aoi()
 
     def _rebuild_batch_per_aoi(self):
-        for w in self.batch_per_rows.winfo_children():
-            w.destroy()
+        # Clear AOI rows only (grid rows ≥ 1); keep the header (row 0) intact.
+        for w in self.batch_per_grid.grid_slaves():
+            try:
+                if int(w.grid_info().get("row", 0)) >= 1:
+                    w.destroy()
+            except Exception:
+                pass
         new_map = {}
         _spk_opts = ["none"] + SPECKLE_FILTER_NAMES
         _dem_default = SNAP_DEM_TAGS.get(self.v_dem.get(), "cop30")
-        for pth in self._batch_aois:
+        g = self.batch_per_grid
+        for r, pth in enumerate(self._batch_aois, start=1):
             prev = self._batch_per_aoi.get(pth)
             saved = self._batch_saved_per_aoi.get(pth, {})   # from persisted config
             pv = prev[0] if prev else tk.StringVar(value=saved.get("preset", PRESET_LABELS["sigma0"]))
@@ -6517,30 +6923,48 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             env = prev[3] if prev and len(prev) > 3 else tk.StringVar(value=saved.get("end", self.v_end.get()))
             dv = prev[4] if prev and len(prev) > 4 else tk.StringVar(value=saved.get("dem", _dem_default))
             new_map[pth] = (pv, sv, stv, env, dv)
-            row = tk.Frame(self.batch_per_rows, bg=BG); row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=os.path.basename(pth)[:24], font=(_FONT_FAM, 8), bg=BG, fg=FG,
-                     width=24, anchor="w").pack(side=tk.LEFT)
-            self._mk_optmenu(row, pv, list(PRESET_LABELS.values()), width=14).pack(side=tk.LEFT)
-            self._mk_optmenu(row, sv, _spk_opts, width=11).pack(side=tk.LEFT, padx=3)
-            self._mk_optmenu(row, dv, DEM_TAG_LIST, width=8).pack(side=tk.LEFT, padx=3)
-            self._entry(row, stv, width=10).pack(side=tk.LEFT, padx=(3, 0))
-            self._entry(row, env, width=10).pack(side=tk.LEFT, padx=(3, 0))
+            # columns mirror the header: 0 name, 1 pipeline, 2 speckle, 3 ⚙, 4 DEM, 5 start, 6 end, 7 📅
+            tk.Label(g, text=os.path.basename(pth)[:24], font=(_FONT_FAM, 8), bg=BG, fg=FG,
+                     anchor="w").grid(row=r, column=0, sticky="w", padx=(0, 6))
+            self._mk_optmenu(g, pv, list(PRESET_LABELS.values()), width=14).grid(row=r, column=1, sticky="ew", padx=1, pady=1)
+            self._mk_optmenu(g, sv, _spk_opts, width=11).grid(row=r, column=2, sticky="ew", padx=1, pady=1)
+            # ⚙ tunes THIS AOI's speckle params for its currently-selected filter
+            self._btn(g, "⚙", lambda p=pth, s=sv: self._open_per_aoi_filter_config(p, s.get()),
+                      color=BG2, font=(_FONT_FAM, 9)).grid(row=r, column=3, padx=1, pady=1)
+            self._mk_optmenu(g, dv, DEM_TAG_LIST, width=8).grid(row=r, column=4, sticky="ew", padx=1, pady=1)
+            self._entry(g, stv, width=10).grid(row=r, column=5, sticky="ew", padx=1, pady=1)
+            self._entry(g, env, width=10).grid(row=r, column=6, sticky="ew", padx=1, pady=1)
             if HAS_CALENDAR:
-                self._btn(row, "📅", lambda s=stv, e=env: self._show_calendar_range(s, e),
-                          color=BG2, font=(_FONT_FAM, 10)).pack(side=tk.LEFT, padx=(3, 0))
+                self._btn(g, "📅", lambda s=stv, e=env: self._show_calendar_range(s, e),
+                          color=BG2, font=(_FONT_FAM, 10)).grid(row=r, column=7, padx=1, pady=1)
+            # 🗑 removes just THIS AOI from the batch queue (with a confirm)
+            self._btn(g, "🗑", lambda p=pth: self._batch_remove_one(p),
+                      color=BG2, font=(_FONT_FAM, 10)).grid(row=r, column=8, padx=(6, 1), pady=1)
         self._batch_per_aoi = new_map
 
-    def _batch_apply_row1_dates(self):
-        if not self._batch_aois:
+    def _batch_apply_col_to_all(self, idx):
+        """Copy the FIRST AOI row's value in ONE column to every other row, leaving
+        the other columns untouched. idx into (pipeline0, speckle1, start2, end3,
+        dem4). For the speckle column, also propagate row 1's ⚙-tuned params so the
+        filter carries its tuning, not just its name."""
+        aois = self._batch_aois
+        if len(aois) < 2:
             return
-        first = self._batch_per_aoi.get(self._batch_aois[0])
-        if not first or len(first) < 4:
+        first = self._batch_per_aoi.get(aois[0])
+        if not first or len(first) <= idx:
             return
-        start, end = first[2].get(), first[3].get()
-        for pth in self._batch_aois[1:]:
+        val = first[idx].get()
+        for pth in aois[1:]:
             row = self._batch_per_aoi.get(pth)
-            if row and len(row) >= 4:
-                row[2].set(start); row[3].set(end)
+            if row and len(row) > idx:
+                row[idx].set(val)
+        if idx == 1:   # speckle column → also mirror row 1's tuned params
+            p0 = self._batch_per_aoi_params.get(aois[0])
+            for pth in aois[1:]:
+                if p0:
+                    self._batch_per_aoi_params[pth] = dict(p0)
+                else:
+                    self._batch_per_aoi_params.pop(pth, None)
 
     def _batch_cfg(self, aoi_path, preset, speckle, out_base, start_date=None, end_date=None,
                    speckle_params=None, dem=None):
@@ -6555,11 +6979,22 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             sfx = "nospeckle"
         else:
             sfx = speckle
-        sub = f"{preset}_{sfx}_{dem_tag}"
+        # Finals group by PIPELINE (preset_speckle, DEM dropped from the folder
+        # name); every AOI's finals land together in one <pipeline>\ASC|DSC, kept
+        # apart by the AOI label already carried in each filename. Downloads and
+        # SNAP tiles stay PER-AOI (dem kept in the internal _snap path so combos
+        # never clash), so an AOI's scenes are downloaded once and reused across
+        # its pipelines. The DEM still lives in every filename → outputs match the
+        # single-AOI tab exactly. Skip/marker globs are AOI-scoped (see
+        # _final_exists / _group_done_marker) so merged AOIs can't skip each
+        # other's dates. ponytail: unconditional new layout — old <AOI>\<combo>
+        # batch outputs won't be found and will reprocess.
+        sub = f"{preset}_{sfx}_{dem_tag}"      # per-AOI internal path (keeps dem)
+        pipeline = f"{preset}_{sfx}"           # merged finals folder (drops dem)
         aoi_root = os.path.join(out_base, aoi_label)
         safe_dir = os.path.join(aoi_root, "_safe")            # per-AOI, shared across its combos
-        snap_dir = os.path.join(aoi_root, sub, "_snap")
-        out_dir  = os.path.join(aoi_root, sub)
+        snap_dir = os.path.join(aoi_root, sub, "_snap")       # per (AOI, combo incl. dem)
+        out_dir  = os.path.join(out_base, pipeline)           # pipeline-first, AOIs merged
         graph_names = {"sigma0": "s1_sigma0_standard.xml", "gamma0": "s1_gamma0_rtc.xml"}
         graph_path  = os.path.join(_SCRIPT_DIR, "snap_graphs", graph_names.get(preset, ""))
         scales = []
@@ -6577,6 +7012,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             "cdse_user": self.v_cdse_user.get(), "cdse_pass": self.v_cdse_pass.get(),
             "s3_access": self.v_s3_access.get(), "s3_secret": self.v_s3_secret.get(),
             "do_download": True, "do_snap": True, "do_indices": True,
+            # Resume-friendly: skip DOWNLOADING any date that already has a final
+            # (or a .done marker). Harmless on a fresh run (no finals → downloads
+            # everything); on a re-run it stops re-fetching already-finished dates,
+            # since batch deletes zips/.SAFE after each chunk so there's nothing
+            # on-disk left to skip against otherwise.
+            "skip_if_final": True,
             "clean_snap": self.v_clean_snap.get(),
             "clean_safe": False,   # keep .SAFE so an AOI's pipeline combos reuse the download
             "bands": {b: self.v_bands[b].get() for b in ALL_BANDS},
@@ -6614,6 +7055,9 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 pv, sv, stv, env, dv = row
                 per_aoi[pth] = {"preset": pv.get(), "speckle": sv.get(),
                                 "start": stv.get(), "end": env.get(), "dem": dv.get()}
+                _pp = self._batch_per_aoi_params.get(pth)
+                if _pp:
+                    per_aoi[pth]["speckle_params"] = _pp
         per_aoi = {a: per_aoi[a] for a in self._batch_aois if a in per_aoi}
         self._batch_saved_per_aoi = per_aoi
         _save_config({"batch": {
@@ -6671,7 +7115,12 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 if not row:
                     messagebox.showerror("Batch", "Per-AOI table not built — reselect Per-AOI mode."); return
                 pv, sv, stv, env, dv = row
-                sk, sp = self._speckle_spec(sv.get())
+                # use this AOI's ⚙-tuned params, but only if they match the filter
+                # still selected on the row (else fall back to defaults for it)
+                _pp = self._batch_per_aoi_params.get(a)
+                if _pp and _pp.get("filter") != sv.get():
+                    _pp = None
+                sk, sp = self._speckle_spec(sv.get(), _pp)
                 jobs.append((a, pv.get(), sk, sp, dv.get(), stv.get(), env.get()))
 
         if not messagebox.askyesno("Run batch",
@@ -6727,6 +7176,8 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             self._log("\n" + "#" * 62)
             self._log(f"# BATCH {idx}/{total}:  {label}  [{start} → {end}]")
             self._log("#" * 62)
+            # drive the top "AOI k/N" bar (revealed on first use; multi-AOI only)
+            self._update_progress("aoi", idx, total, Path(aoi).stem)
             cfg = self._batch_cfg(aoi, preset, speckle, out_base, start, end,
                                   speckle_params=speckle_params, dem=dem)
             # Disk-budget chunking applies in batch mode too (section 2e budget):
@@ -6739,6 +7190,28 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             cfg["stop_event"]  = self._stop_event
             cfg["force_event"] = self._force_event
             cfg["set_proc_cb"] = set_proc
+            # Field-clustering (3b): crop each AOI to tight per-field clusters
+            # instead of one whole-AOI bbox, like the single-AOI tab. Runs off the
+            # UI thread here — _prepare_clusters is Tk-free. Gated on the checkbox;
+            # off → whole-AOI as before. Clusters from the AOI's own polygons (no
+            # per-AOI fields file in batch → no masking). Adds cluster tags to
+            # finals, so pre-existing untagged batch finals for the same date will
+            # reprocess. ponytail: one global toggle for the batch, not per-AOI.
+            if cfg.get("cluster_aoi"):
+                try:
+                    _cl = _prepare_clusters(
+                        aoi, "", _safe_float(self.v_cluster_gap.get(), 5.0))
+                    for _m in _cl.get("logs", []):
+                        self._log(_m)
+                    if _cl.get("union_wkt"):
+                        cfg["aoi_wkt"] = _cl["union_wkt"]
+                    if _cl.get("npoly", 1) > 1 and _cl.get("clusters"):
+                        cfg["sub_aois"] = _cl["clusters"]
+                        self._log(f"[fields] {len(_cl['clusters'])} cluster(s) from "
+                                  f"{_cl['npoly']} AOI polygons "
+                                  f"(gap <= {_safe_float(self.v_cluster_gap.get(), 5.0):g} km)")
+                except Exception as _ce:
+                    self._log(f"[fields] batch clustering skipped: {_ce}")
             for _d in (cfg["safe_dir"], cfg["snap_dir"], cfg["out_dir"]):
                 try: os.makedirs(_d, exist_ok=True)
                 except Exception: pass
@@ -6758,6 +7231,10 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         finished = {a for a, n in jobs_per_aoi.items() if ok_per_aoi.get(a, 0) == n}
         if finished:
             self.after(0, lambda f=finished: self._batch_prune_finished(f))
+            # non-blocking reminder (no modal mid/after-batch to avoid stalling the queue)
+            self._log("\n[Reminder] For each finished AOI, run “Continue downloading / Check "
+                      "missing dates” to confirm catalogue coverage; once confirmed you may delete "
+                      "that AOI’s Done_files_S1\\*.done markers (finals are unaffected).")
         self._on_done(ok_all)
 
     def _batch_prune_finished(self, finished):
@@ -7035,42 +7512,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         self._log("Preparing AOI …")
 
         def _prep():
-            out = {"logs": [], "clusters": [], "coverage": 1.0, "npoly": 1}
-            try:
-                import geopandas as gpd
-                gdf = gpd.read_file(cfg["aoi_path"]).to_crs("EPSG:4326")
-                union = _safe_union(gdf)
-                out["union_wkt"] = union.wkt
-            except Exception as e:
-                out["error"] = ("AOI", f"Cannot read AOI file:\n{e}")
-                return out
-            try:
-                if _fields_path:
-                    _csrc = _read_fields(_fields_path).to_crs("EPSG:4326")
-                    try: _csrc["geometry"] = _csrc.geometry.make_valid()
-                    except Exception: _csrc["geometry"] = _csrc.geometry.buffer(0)
-                    _total = len(_csrc)
-                    _sel = _csrc[_csrc.intersects(union)]
-                    if len(_sel) == 0:
-                        out["logs"].append("[fields] no field polygons fall inside "
-                                           "the AOI — using whole AOI")
-                    else:
-                        _csrc = _sel
-                        out["logs"].append(f"[fields] {len(_csrc)} of {_total} field "
-                                           "polygons fall inside the AOI")
-                else:
-                    _csrc = gdf
-                out["npoly"] = int(len(_csrc))
-            except Exception as _ce:
-                _csrc, out["npoly"] = gdf, 1
-                out["logs"].append(f"[fields] could not read fields file: {_ce}")
-            if out["npoly"] > 1:
-                try:
-                    out["clusters"], out["coverage"] = _cluster_polygons(
-                        _csrc, max_gap_km=_gap)
-                except Exception as _ce:
-                    out["logs"].append(f"[fields] clustering skipped: {_ce}")
-            return out
+            return _prepare_clusters(cfg["aoi_path"], _fields_path, _gap)
 
         def _prep_thread():
             res = _prep()
@@ -7151,9 +7593,15 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 else:                       # prune finished processes
                     self._cur_procs = {q for q in self._cur_procs if q.poll() is None}
         cfg["set_proc_cb"] = _set_proc
+        # single-AOI done_cb wrapper: normal teardown, then the coverage/.done
+        # reminder on a clean finish (batch uses self._on_done directly → no modal)
+        def _done_single(ok, c=cfg):
+            self._on_done(ok)
+            if ok and c.get("_run_clean") and c.get("_done_dir"):
+                self.after(0, lambda: self._prompt_done_cleanup(c["_done_dir"]))
         self._thread = threading.Thread(
             target=run_pipeline,
-            args=(cfg, self._log, self._on_done, self._update_progress),
+            args=(cfg, self._log, _done_single, self._update_progress),
             daemon=True)
         self._thread.start()
 
@@ -7173,7 +7621,7 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
         s, e = self.v_start.get().strip(), self.v_end.get().strip()
         src_lbl = {"asf": "ASF", "cdse": "CDSE", "cdse_s3": "CDSE S3",
                    "auto": "Auto"}.get(src, "ASF")
-        if not messagebox.askyesno("Download missing / failed dates",
+        if not messagebox.askyesno("Continue downloading / Check missing dates",
                 f"Search {src_lbl} over {s} → {e} and download + process only the "
                 f"dates you don't already have?\n\n"
                 f"A date is skipped if it exists at ANY stage in your folders — "
@@ -7182,6 +7630,47 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
                 f"Check SNAP + indices are on if you want them turned into finals."):
             return
         self._on_start(fill_missing=True)
+
+    def _prompt_done_cleanup(self, done_dir):
+        """After a clean run, remind the user to confirm catalogue coverage
+        (via 'Continue downloading / Check missing dates') before deleting this AOI's .done
+        markers, and offer to delete them now. Only the .done files are touched —
+        finals and SNAP tiles are never removed here."""
+        try:
+            dones = glob.glob(os.path.join(done_dir, "*.done")) if done_dir else []
+        except Exception:
+            dones = []
+        if not dones:
+            return   # nothing to clean up (e.g. no groups finished here)
+        dlg = tk.Toplevel(self)
+        dlg.title("Run complete")
+        dlg.configure(bg=BG); dlg.resizable(False, False); dlg.grab_set()
+        msg = ("Run finished with no errors.\n\n"
+               "▸ Recommended: run  “Continue downloading / Check missing dates”  to confirm the\n"
+               "   catalogue has no missing dates (a coverage check — it searches the\n"
+               "   source and fetches only gaps).\n\n"
+               f"▸ Once coverage is confirmed, this AOI’s {len(dones)} .done marker(s)\n"
+               f"   can be deleted. They live in:\n     {done_dir}\n\n"
+               "Deleting them only affects future top-ups (zero-coverage dates would be\n"
+               "re-checked once); your finals are never touched.")
+        tk.Label(dlg, text=msg, font=FONT, bg=BG, fg=FG, justify="left").pack(
+            padx=16, pady=(14, 8), anchor="w")
+        _bfr = tk.Frame(dlg, bg=BG); _bfr.pack(fill=tk.X, padx=14, pady=(4, 12))
+        def _coverage():
+            dlg.destroy()
+            self._on_retry_failed()   # the catalogue coverage check
+        def _delete():
+            n = 0
+            for _d in dones:
+                try: os.remove(_d); n += 1
+                except Exception: pass
+            self._log(f"[Cleanup] Deleted {n} .done marker(s) from {done_dir}")
+            dlg.destroy()
+        self._btn(_bfr, "  Run coverage check now  ", _coverage).pack(side=tk.LEFT)
+        self._btn(_bfr, "  Delete .done  ", _delete, color=BG2).pack(side=tk.LEFT, padx=(6, 0))
+        self._btn(_bfr, "  Close  ", dlg.destroy, color=BG2).pack(side=tk.RIGHT)
+        dlg.update_idletasks()
+        dlg.geometry(f"+{self.winfo_x() + 160}+{self.winfo_y() + 120}")
 
     def _on_window_close(self):
         if getattr(self, "_running", False):
@@ -7195,6 +7684,13 @@ function clearAll(){drawn.clearLayers();st("Cleared — draw a new shape.");}
             try: self._on_stop(graceful=False)
             except Exception: pass
         self.destroy()
+        # Hard-exit so the process REALLY dies. Download workers run in a
+        # (non-daemon) ThreadPoolExecutor; a blocking s3.download_file keeps the
+        # interpreter alive after the window is gone → an orphan pythonw lingers
+        # holding a handle on the .partdir, so the user can't re-download it.
+        # ponytail: os._exit skips atexit/flush — fine on quit (run-log writes are
+        # per-line and closed immediately; config is saved on change, not at exit).
+        os._exit(0)
 
     def _on_stop(self, graceful=True):
         # Graceful (default): stop launching new scenes, but let the SNAP run(s)

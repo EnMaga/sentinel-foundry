@@ -10,7 +10,20 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 > 📖 **Using Sentinel Foundry in your research?** Please cite it: click
 > **"Cite this repository"** in the sidebar (APA/BibTeX from
 > [CITATION.cff](CITATION.cff)), or cite *Magazzino, E. (2026). Sentinel
-> Foundry (v1.0.9) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+> Foundry (v1.0.14) [Computer software]. https://github.com/EnMaga/sentinel-foundry*
+
+---
+
+## What's new in v1.0.14
+
+- **Field-clustering in batch mode (BETA — not yet live-tested).** The Batch tab now honours the section-3b **Cluster AOI** toggle and crops each AOI to tight per-field clusters, matching the single-AOI tool. See the ⚠ note under [Multiple-AOI batch runner](#multiple-aoi-batch-runner).
+- **Pipeline-first merged batch layout.** Batch finals for every AOI now land together in one `<preset>_<speckle>\ASC|DSC\` folder (kept apart by the AOI label in each filename) instead of per-AOI `<AOI>\<combo>\` folders. ⚠ Pre-v1.0.14 batch outputs won't be found and will reprocess — see [Output folder layout](#output-folder-layout--reusing-existing-work).
+- **Cheaper batch resume (`skip_if_final`).** A stopped/re-run batch no longer re-downloads or reprocesses any date that already has a final or `.done` marker — verified working.
+- **Batch progress bars** — a top **AOI k/N** bar plus a **Batch** chunk bar (`chunk k/~N`).
+- **Per-AOI speckle tuning in Batch Per-AOI mode** (⚙ per row) and **per-column ⇩ apply-to-all** buttons; per-row **🗑 remove** + **🗑 Delete all**.
+- **Completion reminder** after a clean single-AOI run (run coverage check / delete `.done`).
+- **"Continue downloading / Check missing dates"** — the footer button (formerly "Download missing / failed dates") relabelled; behaviour unchanged.
+- **Robustness** — download truncation size-guard (ASF + OData), killable S3/CDSE downloads, date-aware chunking (never splits a multi-frame date across chunks), and an `os._exit` on window-close so no orphan process locks the download drive (both SAR & Optical Foundry).
 
 ---
 
@@ -330,14 +343,53 @@ The **Batch** tab processes **many AOIs in one sequential run** — each AOI (an
 1. **AOI files** (section 1) — add `.geojson` / `.shp` / `.gpkg` files individually or a whole folder. The list is saved on Run, so it reappears next launch; finished AOIs drop off automatically and unfinished ones stay and resume from disk.
 2. **Pipeline assignment** (section 2) — three modes:
    - **Uniform** — one pipeline + speckle filter + DEM applied to *every* AOI. Use it to produce the same product across many study sites. **Jobs = number of AOIs** (one each).
-   - **All combinations** — a full grid: every AOI × every ticked pipeline (Sigma0 / Gamma0) × every ticked speckle filter × every ticked DEM. Each combination is a separate job with its own output folder, so you can compare preprocessing choices side by side for the same site. **Jobs = AOIs × pipelines × speckles × DEMs** — this multiplies quickly, so tick deliberately. All combinations of a given AOI reuse a single download (see disk-budget note below).
-   - **Per-AOI** — one row per AOI where you pick its pipeline, speckle, DEM **and its own date range** independently (📅 picker per row; *Apply row 1's dates to all* fills the rest). Use it when sites differ in season, orbit, or desired product. **Jobs = number of AOIs** (one each).
+   - **All combinations** — a full grid: every AOI × every ticked pipeline (Sigma0 / Gamma0) × every ticked speckle filter × every ticked DEM. Each combination is a separate job with its own output folder, so you can compare preprocessing choices side by side for the same site. **Jobs = AOIs × pipelines × speckles × DEMs** — this multiplies quickly, so tick deliberately. All combinations of a given AOI reuse a single download (see disk-budget note below). **Date range:** this mode has no date field — it uses the **Download tab's** Start/End for every combination (shown as a hint under the section).
+   - **Per-AOI** — one row per AOI where you pick its pipeline, speckle, DEM **and its own date range** independently (📅 picker per row). Use it when sites differ in season, orbit, or desired product. **Jobs = number of AOIs** (one each). Each row also has a **⚙** button to **tune that AOI's speckle-filter parameters** (window size, etc.) for its selected filter — so two AOIs can run the *same* filter with *different* settings. The tuning persists across reopen and applies only while that row keeps the filter it was tuned for. The header has a **per-column "⇩ apply to all"** button (pipeline / speckle / DEM / start / end): each copies **row 1's value down that one column only**, leaving the other columns untouched (the speckle button also carries row 1's ⚙ tuning).
 3. **Common settings** (section 3) — output bands and worker counts (unzip / SNAP jobs / index) are **shared across all AOIs** and bound to the same controls as the Download/Processing tabs, so you set them once. Source, credentials, satellites, orbit and scale (dB/linear) also come from those tabs.
 4. **Output base** (section 4) — outputs go to `<base>/<AOI>/<pipeline_speckle_DEM>/`; each AOI's downloads and extraction live under `<base>/<AOI>/_safe/`.
 
-Press **▶ Run Batch**. **Stop** halts after the current scene (partial downloads are kept), and finished AOIs are skipped on a re-run.
+Press **▶ Run Batch**. **Stop** halts after the current scene (partial downloads are kept). On a re-run, fully-finished AOIs drop off automatically, and within a still-unfinished AOI any date that already has a final (or `.done`) is **not re-downloaded or reprocessed** — so a stopped batch resumes cheaply from where it left off.
+
+> **⚠ Batch field-clustering — BETA (new in v1.0.14, not yet live-tested).** With the **Cluster AOI** checkbox (section 3b) **on**, batch now crops SNAP to tight per-field clusters — like the single-AOI tool — instead of one whole-AOI bounding box. It's one global toggle for the whole batch, and it clusters from **each AOI's own polygons** (batch has no separate per-AOI fields file, so the AOI file itself *is* the field set — there's no extra field-mask step). Finals then carry a per-cluster tag, matching single-AOI output. With the box **off**, batch runs SNAP over the whole AOI bbox as before. This path is **new in v1.0.14 and has not yet been live-tested on a real multi-AOI batch** — verify your first clustered batch and please [report anything off](https://github.com/EnMaga/sentinel-foundry/issues).
 
 > **Disk budget applies in batch mode too.** Set the section-2e **disk budget** (`safe_scratch_gb`) and each AOI is processed in chunks — extract ≤ budget GB of `.SAFE` → SNAP → index → delete — so no more than one budget's worth of `.SAFE` is ever on disk at once (same as a single-AOI run). An AOI that runs **multiple combinations** keeps its downloaded `.zip`s so each combination re-extracts chunks **without re-downloading**; a **single-combination** AOI (Uniform / Per-AOI) deletes each `.zip` as it is extracted to free space. Leave the budget blank / `0` to extract everything at once (old behaviour).
+
+#### Output folder layout & reusing existing work
+
+**Changed in v1.0.14 — pipeline-first merged layout.** Batch finals no longer sit in a per-AOI `<AOI>\<combo>\` folder. Every AOI's finals for a given recipe now land **together** in one **pipeline** folder (`<preset>_<speckle>`, DEM dropped from the folder name), kept apart by the AOI label already carried in each filename. Downloads and transient SNAP tiles stay per-AOI:
+
+```
+<out_base>\<preset>_<speckle>\                       finals — ALL AOIs merged here
+        ├─ ASC\  DSC\                                final COGs (DEM stays in each filename)
+        └─ Done_files_S1\                            .done resume-markers (shared folder, globbed per-AOI)
+<out_base>\<AOI-stem>\_safe\                          downloads / .zip (per-AOI, shared across that AOI's combos)
+<out_base>\<AOI-stem>\<preset>_<speckle>_<dem>\_snap\ transient SNAP tiles (per AOI + combo, DEM kept)
+```
+
+Example: `Arezzo.geojson` + `Bolgheri.geojson`, σ⁰, Lee Sigma, Copernicus 30 m → both AOIs' finals in `…\sigma0_lee\ASC\`, told apart by the `_Arezzo_` / `_Bolgheri_` label in each `.tif` name. The skip/marker globs are **AOI-label-scoped**, so merging AOIs in one folder can never make one AOI skip another's dates.
+
+> **⚠ Old batch outputs (pre-v1.0.14) won't be found.** Because the finals path changed, batch runs will **not** see outputs written by v1.0.13 or earlier into the old `<AOI>\<combo>\` layout — those dates reprocess into the new merged folder (nothing is corrupted, just duplicated work). Move old data into the new layout first if you want it reused.
+
+**Will a batch reuse data already on the disk?** Only if it sits at **exactly** the new paths above — same `out_base` + preset + speckle for finals, and same AOI stem for `_safe\`. When it matches, already-finished dates are **skipped** (finals + `.done`) and existing `.zip`/`.SAFE` in `_safe\` are **reused** (no re-download); the run just adds the missing dates. It will **not** reuse outputs from the **single-AOI tab** (a different layout). Things to know:
+
+- **The `_safe\` match key is the AOI *file name*, not its geometry.** Same filename stem → same download folder; a renamed file → a fresh download. Never give two different areas the same filename.
+- **Preset / speckle are part of the finals folder name**; **DEM is part of the `_snap` path** but not the finals folder. Changing preset or speckle creates a separate finals folder (by design, for side-by-side comparison). **⚙ per-AOI parameter tuning does *not* change the folder** — the suffix is the filter *name* (e.g. `lee_sigma`).
+
+#### Per-AOI `.done` markers
+
+The group-done sentinels (`.done`, see [Re-running](#re-running-a-range-vs-continue-downloading--check-missing-dates)) are written to a `Done_files_S1\` sub-folder inside the finals folder (the one holding `ASC/` `DSC/`) — *not* in the transient SNAP-tile folder. In the v1.0.14 merged layout several AOIs share that finals folder, so they share `Done_files_S1\` too — but every `.done` glob is **scoped to the AOI's label**, so one AOI's skip check can never be confused by another AOI's markers.
+
+#### Batch progress bars
+
+In batch/chunked mode the progress bars adapt (single-AOI, non-batch runs are unchanged):
+
+- **AOI** — a top bar showing `k/N — <AOI name>`, appears **only** during a multi-AOI batch.
+- **Batch** — the former "Unzip" bar, retitled; it tracks **whole chunks** as `chunk k/~N` rather than individual files. In the static (non-download) batch path `N` is exact; in the pipelined (download-while-processing) path `N` is an estimate (`~`) projected from the catalogue's per-scene byte sizes ÷ the chunk budget, firming up as downloads land.
+- **Download** / **Processing** — unchanged (scenes `k/N` with live rate + ETA).
+
+#### Completion reminder
+
+After a **single-AOI** run finishes with no errors (and wasn't stopped), a dialog offers to **Run coverage check now** (this is the *Continue downloading / Check missing dates* action — it searches the source and reports/fetches any gaps), **Delete .done** (removes only that AOI's `Done_files_S1\*.done`; finals are never touched), or **Close**. A batch run instead logs a non-blocking reminder at the end (a modal per-AOI would stall the queue). Deleting the markers only affects future top-ups — zero-coverage dates would be re-checked once — so confirm coverage first.
 
 ---
 
@@ -355,7 +407,22 @@ If scenes fail to download, the pipeline logs the failure and continues. At the 
 
 Most download failures are *transient* — a dropped TLS connection or a 5xx from the archive (`Read failed`), not a missing scene. A scene that recovers on retry no longer leaves a stale log behind: the `pipeline_errors/…__download*.error.txt` file is deleted the moment that download succeeds.
 
-**Manual retry (↻ Retry failed downloads).** If a run still ends with download errors — e.g. the archive was down and every attempt failed — click **↻ Retry failed downloads** in the footer. It reads the acquisition dates out of the leftover `…__download*.error.txt` logs, forces the download step on, and re-runs the scene search restricted to just those dates. Already-downloaded scenes are skipped, so only the missing ones are re-fetched. There's nothing to retry if `pipeline_errors/` has no download logs.
+**Manual retry (↻ Continue downloading / Check missing dates).** If a run still ends with download errors — e.g. the archive was down and every attempt failed — click **↻ Continue downloading / Check missing dates** in the footer. There's nothing to retry if `pipeline_errors/` has no download logs *and* every date in the range is already finished.
+
+---
+
+### Re-running a range vs. "Continue downloading / Check missing dates"
+
+A common question: if I press **START** again over the same date range, will it re-download everything, or check what's already done?
+
+**A plain re-run does *not* consult your finished outputs to decide what to download.** The download step only skips a scene whose `.zip` or `.SAFE` is still physically present in the download folder. So:
+
+- If your previous run had **"After step 2: delete .SAFE source files"** ticked, those files are gone → a plain re-run **re-downloads the whole range** from scratch.
+- If it was unticked, the `.zip`/`.SAFE` are still on disk → those scenes are skipped.
+
+Either way the **SNAP and indices steps always skip dates that are already finished** — they key off the final `S1_<date>…_<ASC|DSC>_*.tif` products and the per-group `.done` markers (stored per-AOI in `<out_dir>\Done_files_S1\`) — so a plain re-run never *reprocesses*. The only wasted work is the re-download.
+
+**To top up a run — fetch only the dates you're actually missing — press `↻ Continue downloading / Check missing dates`** (footer) instead of START. It searches your chosen source over the whole `[start, end]` range but skips every date that already exists at **any** stage: `.zip`, `.SAFE`, SNAP GeoTIFF, final product, *or* a `.done` marker. (The `.done` marker matters for **zero-coverage dates** — a scene whose footprint covers none of your AOI finishes cleanly but produces no `.tif`; without the marker it would be re-downloaded and discarded on every run.) Only dates truly absent everywhere are downloaded and processed, and this is correct whether or not the `.SAFE` were cleaned up — so it's the right choice for **extending or repairing a timeseries**. Make sure **SNAP + indices are ticked** if you want the fetched dates turned into finals. The same button also absorbs any leftover `pipeline_errors/…__download*.error.txt` failures, since those dates count as "missing" too.
 
 ---
 
@@ -615,6 +682,7 @@ Italian National Recovery and Resilience Plan (**PNRR**), Mission 4
 - ~~**S1 parallel SNAP processing**~~ *(done — section 2e "Parallel SNAP Jobs": configurable workers + JVM heap; you can also open several SAR Foundry windows from the launcher — see "Running several runs at once")*
 - ~~**Batch disk budget + incremental per-batch output (S1)**~~ *(done — section 2e; extract → SNAP → index → delete per chunk, COG indices produced per batch, resume-safe `.SAFE` delete, elapsed/ETA per batch, RAM-aware SNAP-worker default; see "Batch disk budget & incremental output")*
 - ~~**Multiple-AOI batch runner (S1)**~~ *(done — Batch tab; process many AOIs sequentially with uniform / all-combinations / per-AOI pipeline assignment; now honours the section-2e disk budget per AOI, keeping zips for multi-combo AOIs so combinations don't re-download; see "Multiple-AOI batch runner")*
+- ~~**Field-clustering in batch mode (S1)**~~ *(v1.0.14, **BETA / not yet live-tested** — Batch now honours the section-3b Cluster AOI toggle and crops to per-field clusters like the single-AOI tool; finals for all AOIs share a pipeline-first merged folder. See "Multiple-AOI batch runner".)*
 - **S1-SliceAssembly** — ESA's recommended approach to eliminate tile seams: assemble adjacent GRD slices *before* calibration. Implementation complete but disabled due to JAI tile-cache `NullPointerException` in SNAP 12.
 - **Copernicus CDSE for S2** — *not planned*. S2 uses AWS EarthSearch (free, anonymous, identical data). CDSE S2 would require replacing the entire `satellitetools` search/download layer with no scientific gain.
 - ~~**Copernicus CDSE integration for S1**~~ *(done — Download tab, section 6b)*
