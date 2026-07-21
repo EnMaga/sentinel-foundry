@@ -1,7 +1,7 @@
 """Self-check for _final_exists (date+orbit parsing → final-product match).
 Run in-venv:  .venv\\Scripts\\python test_final_exists.py"""
 import os, sys, tempfile
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 from s1_pipeline_ui import _final_exists
 
 

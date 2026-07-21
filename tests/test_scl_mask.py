@@ -6,6 +6,8 @@ cross-zone reproject_match adds -32768. The old mask lumped that fill into
 "cloud"; binary_fill_holes then swallowed the whole island, yielding 0 valid
 pixels and a spurious "no usable pixels" for a day that clearly has data.
 """
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 import numpy as np
 from s2_pipeline_ui import _scl_valid_mask
 

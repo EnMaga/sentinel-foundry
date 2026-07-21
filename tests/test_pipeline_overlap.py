@@ -3,7 +3,7 @@ Run inside the venv:  .venv\\Scripts\\python test_pipeline_overlap.py
 Exercises real code paths (real files, real threads) — no SNAP needed."""
 import os, sys, tempfile, threading, time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 from s1_pipeline_ui import _ReadyBudget, _SAFE_EST
 
 

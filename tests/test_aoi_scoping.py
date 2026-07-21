@@ -1,7 +1,8 @@
 """AOI-scoping guard for the pipeline-first batch layout: many AOIs share one
 out_dir / Done_files_S1, so the skip globs must NOT match another AOI's date.
 Run: python test_aoi_scoping.py"""
-import os, tempfile
+import os, sys, tempfile
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 from s1_pipeline_ui import _final_exists, _group_done_marker
 
 SCENE = "S1A_IW_GRDH_1SDV_20240715T163030_20240715T163055_054xyz.SAFE"  # -> 20240715 ASC

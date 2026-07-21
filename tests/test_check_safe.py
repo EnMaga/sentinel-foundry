@@ -1,5 +1,7 @@
 """Minimal self-checks for the B7 (single-pol not-CORRUPT) and pol-detection
 guards in check_safe.py. Run: python test_check_safe.py"""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root
 import check_safe as cs
 
 
