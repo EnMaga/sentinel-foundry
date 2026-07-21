@@ -16,7 +16,7 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 
 ## 🌐 New here? Start with the tutorial website
 
-### **▶ [enmaga.github.io/sentinel-foundry](https://enmaga.github.io/sentinel-foundry/)**
+### **▶ [TUTORIAL WEBSITE](https://enmaga.github.io/sentinel-foundry/)**
 
 A guided, **per-tab walkthrough of both apps** with example outputs — the fastest way to see what Sentinel Foundry does and how each screen works before you install anything.
 
