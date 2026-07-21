@@ -14,6 +14,14 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 
 ---
 
+## 🌐 New here? Start with the tutorial website
+
+### **▶ [enmaga.github.io/sentinel-foundry](https://enmaga.github.io/sentinel-foundry/)**
+
+A guided, **per-tab walkthrough of both apps** with example outputs — the fastest way to see what Sentinel Foundry does and how each screen works before you install anything.
+
+---
+
 ## What's new in v1.0.14
 
 - **Field-clustering in batch mode (BETA — not yet live-tested).** The Batch tab now honours the section-3b **Cluster AOI** toggle and crops each AOI to tight per-field clusters, matching the single-AOI tool. See the ⚠ note under [Multiple-AOI batch runner](#multiple-aoi-batch-runner).
@@ -28,8 +36,6 @@ Two desktop GUIs for building Sentinel-1 and Sentinel-2 analysis-ready data pipe
 ---
 
 ## Quick start
-
-> 🌐 **New here? Start with the [tutorial website](https://enmaga.github.io/sentinel-foundry/)** — a guided, per-tab walkthrough of both apps with example outputs.
 
 **Option A — download a ready-made build (no git needed):** grab the zip for
 your OS from the [Releases page](https://github.com/EnMaga/sentinel-foundry/releases),
