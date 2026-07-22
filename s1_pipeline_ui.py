@@ -458,7 +458,11 @@ def _final_exists(out_dir, name, aoi_label=""):
     date, hr = m.group(1), int(m.group(2))
     orbit = "ASC" if hr >= 12 else "DSC"
     _lbl = f"SNAP_{aoi_label}_" if aoi_label else ""
-    return bool(glob.glob(os.path.join(out_dir, "**", f"S1_{date}_{_lbl}*_{orbit}_*.tif"),
+    # orbit is the LAST token before .tif (S1_<date>_SNAP_<aoi>_..._<orbit>.tif),
+    # so the trailing wildcard must be able to match empty. A '_*' here demanded a
+    # token after the orbit and matched no real final → finals were never detected,
+    # breaking resume when no .done marker exists. ponytail: '*' not '_*'.
+    return bool(glob.glob(os.path.join(out_dir, "**", f"S1_{date}_{_lbl}*_{orbit}*.tif"),
                           recursive=True))
 
 
